@@ -73,10 +73,14 @@ douyin_downloader.py download-selected --session-id "<id>" [--output-dir DIR] [-
 # secondary
 douyin_downloader.py download-json "<file.json>" [--output-dir DIR] [--quality ...] [--latest N] [--label NAME]
 douyin_downloader.py download-url "<share-url-or-id>" [--output-dir DIR] [--quality ...] [--cookie-file F]
+douyin_downloader.py download-user "<profile-url-or-sec_uid>" [--latest N] [--output-dir DIR] [--quality ...] [--cookie-file F]
 
 # utility
 douyin_downloader.py list [--output-dir DIR]
 validate_outputs.py "<dir>"
+
+# smoke test (real sockets; --self-test needs no Douyin)
+smoke_download.py --self-test | --account "<url>" [--latest N] [--cookie-file F] | --session-id "<id>"
 ```
 
 All commands print a single JSON object to stdout and use exit code 0/1.

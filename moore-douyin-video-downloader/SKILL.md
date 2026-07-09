@@ -87,13 +87,28 @@ python3 {baseDir}/scripts/douyin_downloader.py capture-finish "<session-id>" --y
 python3 {baseDir}/scripts/douyin_downloader.py download-json "<file.json>" [--latest N]
 ```
 
-## 场景 3：单条分享链接（尽力而为）
+## 场景 3：单条分享链接 / 账号主页（尽力而为）
 
 ```bash
+# 单条视频
 python3 {baseDir}/scripts/douyin_downloader.py download-url "<分享链接或视频ID>"
+
+# 账号主页最新 N 条（best-effort，多数情况下会被签名 API 拦住）
+python3 {baseDir}/scripts/douyin_downloader.py download-user "https://www.douyin.com/user/<sec_uid>" --latest 10
 ```
 
-失败（`failed_recoverable`）时说明抖音反爬拦截，改走代理捕获。
+返回 `failed_recoverable` 时说明抖音反爬/签名拦截，**改走场景 1 代理捕获**（最可靠）。
+
+## 冒烟自测（验证本机环境）
+
+```bash
+# 用本地服务器实测整条 download-selected 管道（不需要抖音）
+python3 {baseDir}/scripts/smoke_download.py --self-test
+# 试真实账号（需抖音可达，通常需登录 cookie）
+python3 {baseDir}/scripts/smoke_download.py --account "<profile-url>" --latest 10 --cookie-file <file>
+# 跑一个已有捕获会话
+python3 {baseDir}/scripts/smoke_download.py --session-id "<id>"
+```
 
 ## 清晰度与水印
 

@@ -189,6 +189,24 @@ class DownloaderContractTests(unittest.TestCase):
         )
         self.assertEqual(dd.resolve_aweme_id("https://www.douyin.com/user/foo"), "")
 
+    def test_resolve_sec_uid(self) -> None:
+        sec = "MS4wLjABAAAA8h6qsIVWZDo6O_H45j0JqZNJk204-KRnbAccoBqpgDpSyJheZKYVWbtUNxQeMgWo"
+        self.assertEqual(dd.resolve_sec_uid(f"https://www.douyin.com/user/{sec}?from_tab_name=main"), sec)
+        self.assertEqual(dd.resolve_sec_uid(sec), sec)
+        self.assertEqual(dd.resolve_sec_uid("https://www.douyin.com/video/123"), "")
+
+    def test_fetch_user_posts_from_web_parses_router_data(self) -> None:
+        # Simulate a profile page whose embedded loader data carries posts.
+        html = "<html><script>window._ROUTER_DATA = " + json.dumps(self.payload) + ";</script></html>"
+        original = dd.http_get_text
+        dd.http_get_text = lambda url, cookie="", timeout=30: html
+        try:
+            records = dd.fetch_user_posts_from_web("MS4wSEC", count=2)
+        finally:
+            dd.http_get_text = original
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["video_url"], "https://v.example.com/play1_hd.mp4")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -697,6 +697,38 @@ def extract_router_data(html: str) -> dict[str, Any] | None:
     return None
 
 
+SEC_UID_RE = re.compile(r"/user/([A-Za-z0-9_\-]+)")
+
+
+def resolve_sec_uid(url_or_id: str) -> str:
+    value = str(url_or_id or "").strip()
+    match = SEC_UID_RE.search(value)
+    if match:
+        return match.group(1)
+    if value.startswith("MS4w"):
+        # bare sec_uid, strip any trailing query
+        return value.split("?", 1)[0].split("/", 1)[0]
+    return ""
+
+
+def fetch_user_posts_from_web(sec_uid: str, count: int = 10, cookie: str = "", quality: str = "best") -> list[dict[str, Any]]:
+    """Best-effort: read a creator's profile page and extract embedded posts.
+
+    Douyin usually gates the post list behind a signed API, so this often
+    returns nothing under anti-bot; capture mode is the reliable path.
+    """
+    if not sec_uid:
+        return []
+    try:
+        html = http_get_text(f"https://www.douyin.com/user/{sec_uid}", cookie=cookie)
+    except Exception:  # noqa: BLE001
+        return []
+    data = extract_router_data(html)
+    records = parse_aweme_payload(data or {}, source="post", quality=quality)
+    records = [r for r in records if r.get("video_url") or r.get("image_urls")]
+    return records[:count] if count else records
+
+
 def fetch_aweme_from_web(aweme_id: str, cookie: str = "", quality: str = "best") -> dict[str, Any] | None:
     """Best-effort: read the server-rendered detail page for one aweme."""
     if not aweme_id:
@@ -1297,6 +1329,32 @@ def command_download_url(args: argparse.Namespace) -> int:
     return 0 if result.get("ok") else 1
 
 
+def command_download_user(args: argparse.Namespace) -> int:
+    cookie = _read_cookie(args.cookie_file)
+    sec_uid = resolve_sec_uid(args.url)
+    if not sec_uid:
+        write_json_response({"ok": False, "state": "unresolved",
+                             "next_step": "Provide a https://www.douyin.com/user/<sec_uid> URL or a sec_uid."})
+        return 1
+    records = fetch_user_posts_from_web(sec_uid, args.latest or 10, cookie, args.quality)
+    if not records:
+        write_json_response({
+            "ok": False,
+            "state": "failed_recoverable",
+            "sec_uid": sec_uid,
+            "next_step": (
+                "Web extraction returned no posts (anti-bot / signed API). Use capture mode: "
+                "capture-prepare then scroll the account's 作品 page, then select + download-selected."
+            ),
+        })
+        return 1
+    label = args.label or records[0].get("author_nickname") or sec_uid[:12]
+    out = delivery_dir(args.output_dir, label)
+    result = download_records(records, out, quality=args.quality, cookie=cookie)
+    write_json_response(result)
+    return 0 if result.get("ok") else 1
+
+
 def command_list(args: argparse.Namespace) -> int:
     base_dir = Path(args.output_dir).expanduser() if args.output_dir else DEFAULT_DELIVERY_DIR
     accounts = []
@@ -1394,6 +1452,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cookie-file", default="")
     p.add_argument("--label", default="")
     p.set_defaults(func=command_download_url)
+
+    p = sub.add_parser("download-user", help="Best-effort account posts download by profile URL / sec_uid")
+    p.add_argument("url", help="https://www.douyin.com/user/<sec_uid> or a bare sec_uid")
+    p.add_argument("--latest", type=int, default=10)
+    p.add_argument("--output-dir", default="")
+    p.add_argument("--quality", default="best", choices=["best", "source"])
+    p.add_argument("--cookie-file", default="")
+    p.add_argument("--label", default="")
+    p.set_defaults(func=command_download_user)
 
     p = sub.add_parser("list", help="List downloaded accounts")
     p.add_argument("--output-dir", default="")
