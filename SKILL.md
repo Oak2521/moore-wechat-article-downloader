@@ -141,7 +141,7 @@ python3 {baseDir}/scripts/wechat_exporter.py exporter-login-start --open
 python3 {baseDir}/scripts/wechat_exporter.py exporter-config --auth-key "<auth-key>"
 ```
 
-规则：扫码时必须选公众号/服务号，不要选小程序；auth-key 有效期约 4 天；不在聊天中打印完整 auth-key；auth-key 优先存 macOS Keychain。
+规则：扫码时必须选公众号/服务号，不要选小程序；auth-key 有效期约 4 天；不在聊天中打印完整 auth-key；auth-key 优先存系统凭据库（macOS Keychain / Windows DPAPI），无凭据库时才用 `--allow-plain-auth-key` 落到 SQLite。
 
 本地管理页（仅用户明确要求时启动）：
 

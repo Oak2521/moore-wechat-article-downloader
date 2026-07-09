@@ -55,9 +55,26 @@ Or let the runtime do the Homebrew install explicitly:
 python3 scripts/wechat_downloader.py history-proxy-setup --install --yes
 ```
 
+On Windows or Linux (no Homebrew), the runtime installs mitmproxy through pip instead:
+
+```bash
+python3 scripts/wechat_downloader.py history-proxy-setup --install --yes
+```
+
 Then start the proxy and install/trust the mitmproxy certificate. The certificate step is explicit because HTTPS capture will not work until the user trusts the local certificate.
 
-`history-proxy-enable --yes` saves current macOS HTTP/HTTPS proxy settings before routing traffic to the local adapter. `history-proxy-disable --yes` restores the saved settings.
+- **macOS**: `history-proxy-enable --yes` saves current HTTP/HTTPS proxy settings via `networksetup` before routing traffic to the local adapter; `history-proxy-disable --yes` restores them.
+- **Windows**: the same commands read and write the per-user WinINET proxy (the `Internet 选项` proxy that the WeChat desktop built-in browser honors) through the registry, then notify running apps. The previous `ProxyEnable` / `ProxyServer` / `ProxyOverride` values are saved and restored on disable.
+- **Windows certificate**: after enabling the proxy, open `http://mitm.it`, download the `.p12` (or `.cer`), and install it into `Local Machine → Trusted Root Certification Authorities` (double-click the cert → Install → Local Machine). Restart the WeChat desktop client so it picks up the new proxy and trusted certificate.
+
+## Windows Proxy Captures Nothing
+
+Check, in addition to the general list below:
+
+- run the terminal / Claude as the same Windows user whose `Internet 选项` proxy was changed (DPAPI and the WinINET proxy are per-user)
+- confirm `Internet 选项 → 连接 → 局域网设置` shows `127.0.0.1:8899` after `history-proxy-enable --yes`
+- the mitmproxy root certificate is installed under **Local Machine** trusted roots, not just current user
+- fully quit and reopen the WeChat desktop client after enabling the proxy
 
 ## Proxy Captures Nothing
 

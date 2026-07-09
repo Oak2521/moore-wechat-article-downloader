@@ -9,7 +9,7 @@
 - **按公众号整理** — 下载结果存入 `~/Downloads/wechat-articles/〈公众号名〉/`，一目了然
 - **纯 Python 标准库** — 无需 `pip install`，Python 3.10+ 即可运行
 - **内置防封节奏控制** — Token bucket 限速 + 随机间隔，大批量下载更安全
-- **一次登录四天有效** — 凭证存入 macOS Keychain，无需反复扫码
+- **一次登录四天有效** — 凭证存入系统凭据库（macOS Keychain / Windows DPAPI），无需反复扫码
 
 ## 你可以这样说
 
@@ -89,6 +89,19 @@ python3 --version
 # 仅代理抓取模式需要
 pip install mitmproxy
 ```
+
+## 平台支持
+
+| 功能 | macOS | Windows | Linux |
+|------|:---:|:---:|:---:|
+| URL 直接下载 | ✅ | ✅ | ✅ |
+| Exporter 扫码登录 / 同步 / 下载 | ✅ | ✅ | ✅ |
+| 凭证安全存储 | Keychain | DPAPI | 明文（需 `--allow-plain-auth-key`） |
+| 代理模式自动设置系统代理 | ✅ `networksetup` | ✅ 注册表 + WinINET | ⚠️ 需手动设置代理 |
+
+- **Windows**：凭证通过 DPAPI 加密后存入本地 SQLite（与登录用户绑定，非明文）；代理模式自动读写 `Internet 选项` 的系统代理并在结束后还原，微信桌面客户端内置浏览器走的正是这套代理。
+- **Linux**：URL 下载与 Exporter 同步可用；无系统级凭证库时需加 `--allow-plain-auth-key`，代理模式需自行把系统代理指向 `127.0.0.1:8899`。
+- 代理模式统一依赖 `mitmproxy`；未安装时可运行 `history-proxy-setup --install --yes` 自动安装（macOS 走 Homebrew，其他平台走 `pip`）。
 
 ## 参考文档
 

@@ -189,7 +189,7 @@ There is no Dashboard or local web UI for URL/history flows. Exporter mode can u
 - Do not bypass login, paywalls, deleted content, or permission checks.
 - Never commit or print credential material.
 - If context is missing, stop and show the WeChat desktop step.
-- Never print full exporter auth-key. Store credentials in Keychain when available.
+- Never print full exporter auth-key. Store credentials in the OS secret store when available (macOS Keychain, Windows DPAPI-encrypted blob in SQLite); fall back to plaintext only with explicit `--allow-plain-auth-key`.
 - If auth-key is expired, ask the user to scan-login again.
 
 ## Phases

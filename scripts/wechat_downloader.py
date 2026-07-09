@@ -37,6 +37,9 @@ from pathlib import Path
 from typing import Any
 
 
+IS_WINDOWS = sys.platform.startswith("win")
+IS_MACOS = sys.platform == "darwin"
+
 APP_DIR = Path.home() / ".moore" / "wechat-article-downloader"
 DEFAULT_DELIVERY_DIR = Path.home() / "Downloads" / "wechat-articles"
 ARTICLE_URL_RE = re.compile(r"https?://mp\.weixin\.qq\.com/[^\s\"'<>]+", re.I)
@@ -1629,6 +1632,30 @@ def import_history_rows_from_wechat_cache(
 def process_running(pid: int) -> bool:
     if pid <= 0:
         return False
+    if IS_WINDOWS:
+        # os.kill(pid, 0) calls TerminateProcess on Windows and would kill the
+        # target, so probe liveness through the Win32 API instead.
+        import ctypes
+        from ctypes import wintypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        # Set explicit types so the 64-bit HANDLE is not truncated to int.
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True
@@ -1636,6 +1663,57 @@ def process_running(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+
+
+def terminate_process(pid: int) -> None:
+    """Best-effort terminate a process (and its group/tree) across platforms."""
+    if pid <= 0:
+        return
+    if IS_WINDOWS:
+        # taskkill /T ends the whole process tree, which mitmdump can spawn.
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            capture_output=True,
+            text=True,
+        )
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    deadline = time.time() + 5
+    while time.time() < deadline and process_running(pid):
+        time.sleep(0.2)
+    if process_running(pid):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
+
+
+def open_path_or_url(target: str) -> tuple[bool, str]:
+    """Open a file path or URL in the OS default handler. Returns (ok, method)."""
+    try:
+        if IS_MACOS:
+            subprocess.run(["open", target], check=True)
+            return True, "open"
+        if IS_WINDOWS:
+            os.startfile(target)  # type: ignore[attr-defined]
+            return True, "os.startfile"
+        import webbrowser
+
+        if webbrowser.open(target):
+            return True, "webbrowser"
+        subprocess.run(["xdg-open", target], check=True)
+        return True, "xdg-open"
+    except Exception as exc:
+        return False, str(exc)
 
 
 def mitm_addon_path() -> Path:
@@ -1655,18 +1733,23 @@ def normalize_upstream_proxy(value: str) -> str:
 
 
 def auto_upstream_proxy(port: int) -> str:
-    if sys.platform != "darwin":
-        return ""
+    server = ""
+    proxy_port = ""
     try:
-        service = choose_network_service("")
-        state = get_network_proxy_state(service)
+        if sys.platform == "darwin":
+            state = get_network_proxy_state(choose_network_service(""))
+            web = state.get("web", {})
+            if web.get("enabled_bool"):
+                server = str(web.get("server") or "").strip()
+                proxy_port = str(web.get("port") or "").strip()
+        elif sys.platform.startswith("win"):
+            state = get_windows_proxy_state()
+            if state.get("enabled"):
+                server, proxy_port = parse_windows_proxy_server(str(state.get("server") or ""))
+        else:
+            return ""
     except Exception:
         return ""
-    web = state.get("web", {})
-    if not web.get("enabled_bool"):
-        return ""
-    server = str(web.get("server") or "").strip()
-    proxy_port = str(web.get("port") or "").strip()
     if not server or not proxy_port or proxy_port == "0":
         return ""
     if server in {"127.0.0.1", "localhost"} and proxy_port == str(port):
@@ -1781,7 +1864,7 @@ def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: i
         return {
             "ok": False,
             "error": "mitmdump not found",
-            "install": "Install mitmproxy first, for example: brew install mitmproxy",
+            "install": f"Install mitmproxy first, for example: {mitmproxy_install_hint()}",
             "next_step": "After installing mitmproxy and trusting its certificate, rerun history-proxy-start.",
         }
     addon = mitm_addon_path()
@@ -1814,7 +1897,11 @@ def start_history_proxy(base: Path, session: dict[str, Any], port: int, limit: i
     if upstream:
         cmd.extend(["--mode", f"upstream:{upstream}"])
     cmd.extend(["-s", str(addon)])
-    proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+    if IS_WINDOWS:
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env, creationflags=creationflags)
+    else:
+        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
     log_fh.close()
     state = {
         "ok": True,
@@ -1893,10 +1980,19 @@ def proxy_state_points_to_port(state: dict[str, Any], host: str, port: int) -> b
 
 
 def system_proxy_points_to_port(service: str, host: str, port: int) -> bool:
-    if sys.platform != "darwin":
-        return False
-    selected = choose_network_service(service)
-    return proxy_state_points_to_port(get_network_proxy_state(selected), host, port)
+    if sys.platform.startswith("win"):
+        try:
+            state = get_windows_proxy_state()
+        except Exception:
+            return False
+        if not state.get("enabled"):
+            return False
+        srv, prt = parse_windows_proxy_server(str(state.get("server") or ""))
+        return srv in {host, "localhost"} and prt == str(port)
+    if sys.platform == "darwin":
+        selected = choose_network_service(service)
+        return proxy_state_points_to_port(get_network_proxy_state(selected), host, port)
+    return False
 
 
 def stop_history_proxy(base: Path, session_id: str) -> dict[str, Any]:
@@ -1942,24 +2038,7 @@ def stop_history_proxy(base: Path, session_id: str) -> dict[str, Any]:
         }
     stopped = False
     if process_running(pid):
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except Exception:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except Exception:
-                pass
-        deadline = time.time() + 5
-        while time.time() < deadline and process_running(pid):
-            time.sleep(0.2)
-        if process_running(pid):
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except Exception:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except Exception:
-                    pass
+        terminate_process(pid)
         stopped = True
     state["status"] = "stopped"
     state["stopped_at"] = utc_now()
@@ -1972,6 +2051,136 @@ def stop_history_proxy(base: Path, session_id: str) -> dict[str, Any]:
         "state": str(state_path),
         "next_step": "Turn off the HTTP/HTTPS proxy in system or network settings if you enabled it manually.",
     }
+
+
+# --- Windows system proxy backend (WinINET, used by WeChat desktop) ---
+
+WINDOWS_INTERNET_SETTINGS = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+
+
+def parse_windows_proxy_server(value: str) -> tuple[str, str]:
+    """Parse a Windows ProxyServer value into (host, port).
+
+    Accepts both the simple ``host:port`` form and the per-protocol form
+    ``http=host:port;https=host:port``.
+    """
+    value = str(value or "").strip()
+    if not value:
+        return "", ""
+    if "=" in value:
+        parts: dict[str, str] = {}
+        for chunk in value.split(";"):
+            if "=" in chunk:
+                proto, addr = chunk.split("=", 1)
+                parts[proto.strip().lower()] = addr.strip()
+        value = parts.get("http") or parts.get("https") or next(iter(parts.values()), "")
+    if ":" in value:
+        host, _, port = value.rpartition(":")
+        return host.strip(), port.strip()
+    return value, ""
+
+
+def get_windows_proxy_state() -> dict[str, Any]:
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, WINDOWS_INTERNET_SETTINGS) as key:
+        def read(name: str, default: Any = "") -> Any:
+            try:
+                return winreg.QueryValueEx(key, name)[0]
+            except FileNotFoundError:
+                return default
+
+        enabled = int(read("ProxyEnable", 0) or 0)
+        server = str(read("ProxyServer", "") or "")
+        override = str(read("ProxyOverride", "") or "")
+    return {"enabled": bool(enabled), "server": server, "override": override}
+
+
+def refresh_wininet() -> None:
+    """Notify WinINET that proxy settings changed so running apps pick them up."""
+    import ctypes
+
+    INTERNET_OPTION_SETTINGS_CHANGED = 39
+    INTERNET_OPTION_REFRESH = 37
+    wininet = ctypes.windll.wininet
+    wininet.InternetSetOptionW(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
+    wininet.InternetSetOptionW(0, INTERNET_OPTION_REFRESH, 0, 0)
+
+
+def apply_windows_proxy(enabled: bool, server: str | None = None, override: str | None = None) -> None:
+    import winreg
+
+    with winreg.OpenKey(
+        winreg.HKEY_CURRENT_USER, WINDOWS_INTERNET_SETTINGS, 0, winreg.KEY_SET_VALUE
+    ) as key:
+        winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1 if enabled else 0)
+        if server is not None:
+            winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, server)
+        if override is not None:
+            winreg.SetValueEx(key, "ProxyOverride", 0, winreg.REG_SZ, override)
+    refresh_wininet()
+
+
+def _enable_system_proxy_windows(base: Path, host: str, port: int, yes: bool) -> dict[str, Any]:
+    server = f"{host}:{port}"
+    if not yes:
+        return {
+            "ok": False,
+            "requires_confirmation": True,
+            "proxy": server,
+            "next_step": "Rerun with --yes to set the Windows system HTTP/HTTPS proxy and save the previous state.",
+        }
+    state_path = system_proxy_state_path(base)
+    previous = get_windows_proxy_state()
+    write_json(
+        state_path,
+        {
+            "saved_at": utc_now(),
+            "platform": "windows",
+            "previous": previous,
+            "new": {"host": host, "port": port},
+        },
+    )
+    apply_windows_proxy(True, server=server)
+    return {
+        "ok": True,
+        "proxy": server,
+        "state": str(state_path),
+        "next_step": "Open the WeChat desktop history page and scroll. Run history-proxy-disable when finished.",
+    }
+
+
+def _disable_system_proxy_windows(base: Path, yes: bool) -> dict[str, Any]:
+    state_path = system_proxy_state_path(base)
+    if not state_path.exists():
+        if not yes:
+            return {
+                "ok": False,
+                "requires_confirmation": True,
+                "next_step": "No saved state found. Rerun with --yes to turn the Windows system HTTP/HTTPS proxy off.",
+            }
+        apply_windows_proxy(False)
+        return {"ok": True, "restored": False, "message": "proxy disabled; no saved state was available"}
+    saved = read_json(state_path)
+    if not yes:
+        return {
+            "ok": False,
+            "requires_confirmation": True,
+            "state": str(state_path),
+            "next_step": "Rerun with --yes to restore saved Windows system proxy settings.",
+        }
+    previous = saved.get("previous") if isinstance(saved.get("previous"), dict) else {}
+    apply_windows_proxy(
+        bool(previous.get("enabled")),
+        server=str(previous.get("server") or ""),
+        override=str(previous.get("override") or ""),
+    )
+    saved["restored_at"] = utc_now()
+    write_json(state_path, saved)
+    return {"ok": True, "restored": True, "state": str(state_path)}
+
+
+# --- macOS system proxy backend (networksetup) ---
 
 
 def run_networksetup(args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -2042,28 +2251,36 @@ def set_proxy_from_state(service: str, kind: str, state: dict[str, Any]) -> None
         run_networksetup([state_flag, service, "off"])
 
 
+def mitmproxy_install_hint() -> str:
+    if IS_MACOS and shutil.which("brew"):
+        return "brew install mitmproxy"
+    return f"{Path(sys.executable).name} -m pip install --user mitmproxy"
+
+
 def install_mitmproxy(yes: bool) -> dict[str, Any]:
     if shutil.which("mitmdump"):
         return {"ok": True, "installed": False, "message": "mitmdump already available"}
-    brew = shutil.which("brew")
-    if not brew:
-        return {
-            "ok": False,
-            "error": "Homebrew not found",
-            "install": "Install Homebrew or install mitmproxy manually, then rerun history-proxy-setup.",
-        }
+    # Prefer Homebrew on macOS; fall back to pip everywhere else (Python is
+    # always present for this runtime, so pip is the portable installer).
+    brew = shutil.which("brew") if IS_MACOS else None
+    if brew:
+        cmd = [brew, "install", "mitmproxy"]
+        command_hint = "brew install mitmproxy"
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "--user", "mitmproxy"]
+        command_hint = f"{Path(sys.executable).name} -m pip install --user mitmproxy"
     if not yes:
         return {
             "ok": False,
             "requires_confirmation": True,
-            "command": "brew install mitmproxy",
-            "next_step": "Rerun history-proxy-setup with --install --yes to install mitmproxy via Homebrew.",
+            "command": command_hint,
+            "next_step": "Rerun history-proxy-setup with --install --yes to install mitmproxy.",
         }
-    result = subprocess.run([brew, "install", "mitmproxy"], text=True, capture_output=True)
+    result = subprocess.run(cmd, text=True, capture_output=True)
     return {
         "ok": result.returncode == 0 and bool(shutil.which("mitmdump")),
         "installed": result.returncode == 0,
-        "command": "brew install mitmproxy",
+        "command": command_hint,
         "returncode": result.returncode,
         "stdout_tail": result.stdout[-2000:],
         "stderr_tail": result.stderr[-2000:],
@@ -2085,18 +2302,13 @@ def proxy_setup_status(port: int, open_cert_page: bool = False, install: bool = 
     opened = False
     open_error = ""
     if open_cert_page:
-        try:
-            if sys.platform == "darwin":
-                subprocess.run(["open", "http://mitm.it"], check=True)
-                opened = True
-            else:
-                open_error = "automatic cert-page opening is implemented for macOS only"
-        except Exception as exc:
-            open_error = str(exc)
+        opened, method = open_path_or_url("http://mitm.it")
+        if not opened:
+            open_error = method
     return {
         "ok": bool(mitmdump),
         "mitmdump": mitmdump or "",
-        "install": "" if mitmdump else "Install mitmproxy first, for example: brew install mitmproxy",
+        "install": "" if mitmdump else f"Install mitmproxy first, for example: {mitmproxy_install_hint()}",
         "install_result": install_result,
         "proxy": f"127.0.0.1:{port}",
         "cert_page": "http://mitm.it",
@@ -2113,6 +2325,12 @@ def proxy_setup_status(port: int, open_cert_page: bool = False, install: bool = 
 
 
 def enable_system_proxy(base: Path, service: str, host: str, port: int, yes: bool) -> dict[str, Any]:
+    if sys.platform.startswith("win"):
+        return _enable_system_proxy_windows(base, host, port, yes)
+    return _enable_system_proxy_macos(base, service, host, port, yes)
+
+
+def _enable_system_proxy_macos(base: Path, service: str, host: str, port: int, yes: bool) -> dict[str, Any]:
     selected = choose_network_service(service)
     if not yes:
         return {
@@ -2145,6 +2363,12 @@ def enable_system_proxy(base: Path, service: str, host: str, port: int, yes: boo
 
 
 def disable_system_proxy(base: Path, service: str = "", yes: bool = False) -> dict[str, Any]:
+    if sys.platform.startswith("win"):
+        return _disable_system_proxy_windows(base, yes)
+    return _disable_system_proxy_macos(base, service, yes)
+
+
+def _disable_system_proxy_macos(base: Path, service: str = "", yes: bool = False) -> dict[str, Any]:
     state_path = system_proxy_state_path(base)
     if not state_path.exists():
         selected = choose_network_service(service)
@@ -3160,7 +3384,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS, help="Override runtime directory")
     p.add_argument("--port", type=int, default=8899)
     p.add_argument("--install", action="store_true", help="Install mitmproxy with Homebrew if mitmdump is missing")
-    p.add_argument("--yes", action="store_true", help="Actually run brew install mitmproxy when --install is set")
+    p.add_argument("--yes", action="store_true", help="Actually install mitmproxy (brew on macOS, pip otherwise) when --install is set")
     p.add_argument("--open-cert-page", action="store_true", help="Open http://mitm.it in the default browser")
     p.set_defaults(func=command_history_proxy_setup)
 

@@ -39,6 +39,8 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
+    IS_MACOS,
+    IS_WINDOWS,
     clean_url,
     delivery_dir,
     make_run_id,
@@ -388,10 +390,62 @@ def get_config(base: Path, key: str, default: str = "") -> str:
         db.close()
 
 
+def secret_store_disabled() -> bool:
+    # Kept under the historical env var name so existing tests/tooling keep working.
+    return bool(os.environ.get("MOORE_WECHAT_EXPORTER_DISABLE_KEYCHAIN"))
+
+
 def keychain_available() -> bool:
-    if os.environ.get("MOORE_WECHAT_EXPORTER_DISABLE_KEYCHAIN"):
+    if secret_store_disabled():
         return False
-    return sys.platform == "darwin" and bool(shutil.which("security"))
+    return IS_MACOS and bool(shutil.which("security"))
+
+
+def dpapi_available() -> bool:
+    """Windows DPAPI (per-user encryption) is the secure store on Windows."""
+    return IS_WINDOWS and not secret_store_disabled()
+
+
+def _dpapi_crypt(data: bytes, protect: bool) -> bytes:
+    import ctypes
+    from ctypes import wintypes
+
+    class DATA_BLOB(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    buffer = ctypes.create_string_buffer(data, len(data))
+    blob_in = DATA_BLOB(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+    blob_out = DATA_BLOB()
+    crypt32 = ctypes.windll.crypt32
+    func = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    CRYPTPROTECT_UI_FORBIDDEN = 0x1
+    ok = func(
+        ctypes.byref(blob_in),
+        None,
+        None,
+        None,
+        None,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(blob_out),
+    )
+    if not ok:
+        raise OSError("Windows DPAPI operation failed")
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def dpapi_encrypt(secret: str) -> str:
+    import base64
+
+    return base64.b64encode(_dpapi_crypt(secret.encode("utf-8"), True)).decode("ascii")
+
+
+def dpapi_decrypt(payload: str) -> str:
+    import base64
+
+    return _dpapi_crypt(base64.b64decode(payload.encode("ascii")), False).decode("utf-8")
 
 
 def keychain_account(profile_id: int, display_name: str) -> str:
@@ -464,16 +518,30 @@ def upsert_login_profile(
 
         account = keychain_account(profile_id, display_name)
         storage_kind = "keychain"
+        kind_value = "auth-key"
+        keychain_account_value = ""
         encrypted_payload = ""
         if keychain_available():
             keychain_set(account, auth_key)
+            keychain_account_value = account
+        elif dpapi_available():
+            storage_kind = "dpapi"
+            kind_value = "auth-key-dpapi"
+            encrypted_payload = dpapi_encrypt(auth_key)
         elif allow_plain:
             storage_kind = "plain"
+            kind_value = "auth-key-plain"
             encrypted_payload = auth_key
         else:
-            raise RuntimeError("macOS Keychain unavailable; rerun with --allow-plain-auth-key to store locally in SQLite")
+            raise RuntimeError(
+                "no OS secret store available (macOS Keychain / Windows DPAPI); "
+                "rerun with --allow-plain-auth-key to store locally in SQLite"
+            )
 
-        db.execute("DELETE FROM credential_store WHERE profile_id = ? AND kind IN ('auth-key', 'auth-key-plain')", (profile_id,))
+        db.execute(
+            "DELETE FROM credential_store WHERE profile_id = ? AND kind IN ('auth-key', 'auth-key-plain', 'auth-key-dpapi')",
+            (profile_id,),
+        )
         db.execute(
             """
             INSERT INTO credential_store
@@ -482,8 +550,8 @@ def upsert_login_profile(
             """,
             (
                 profile_id,
-                "auth-key" if storage_kind == "keychain" else "auth-key-plain",
-                account if storage_kind == "keychain" else "",
+                kind_value,
+                keychain_account_value,
                 encrypted_payload,
                 expires_at,
                 now,
@@ -544,8 +612,11 @@ def get_auth_key(base: Path, profile_name: str = "") -> tuple[sqlite3.Row, str]:
         db.close()
     if not cred:
         raise RuntimeError("exporter credential not found; run exporter-config again")
-    if str(cred["kind"]) == "auth-key":
+    kind = str(cred["kind"])
+    if kind == "auth-key":
         return profile, keychain_get(str(cred["keychain_account"]))
+    if kind == "auth-key-dpapi":
+        return profile, dpapi_decrypt(str(cred["encrypted_payload"] or ""))
     return profile, str(cred["encrypted_payload"] or "")
 
 
@@ -1679,7 +1750,7 @@ def render_page(base: Path, selected_account_id: int = 0) -> str:
       <p><a class="button" href="/login/start">本地扫码登录</a></p>
       <form method="post" action="/config">
         <div class="row"><input name="base_url" value="{html_escape(get_config(base, "base_url", DEFAULT_BASE_URL))}" style="width: 230px"><button>保存</button></div>
-        <p class="small">先打开 exporter 网站扫码登录，再把 API 页 auth-key 粘贴到这里。本地会优先存入 macOS Keychain。</p>
+        <p class="small">先打开 exporter 网站扫码登录，再把 API 页 auth-key 粘贴到这里。本地会优先存入系统凭据库（macOS Keychain / Windows DPAPI）。</p>
         <div class="row"><input name="auth_key" placeholder="auth-key" style="width: 230px"><button>配置 auth-key</button></div>
       </form>
       <p><a class="button secondary" href="{html_escape(get_config(base, "base_url", DEFAULT_BASE_URL))}" target="_blank">打开扫码登录页</a></p>
@@ -2087,8 +2158,13 @@ def command_login_qr_start(args: argparse.Namespace) -> int:
     result = start_qr_login(runtime_dir(args.runtime_dir), args.base_url)
     if args.open:
         qrcode_path = Path(str(result["qrcode_path"]))
-        if sys.platform == "darwin":
+        if IS_MACOS:
             subprocess.run(["open", str(qrcode_path)], check=False)
+        elif IS_WINDOWS:
+            try:
+                os.startfile(str(qrcode_path))  # type: ignore[attr-defined]
+            except Exception:
+                webbrowser.open(qrcode_path.as_uri())
         else:
             webbrowser.open(qrcode_path.as_uri())
     write_json_response(result)
