@@ -1,9 +1,23 @@
 ---
 name: moore-wechat-article-downloader
-description: 当用户要下载或管理微信公众号文章时使用本技能。支持三个场景：直接下载已知文章 URL；获取公众号历史文章并选择下载（默认 Exporter 模式，备选代理模式）；订阅多个公众号并定时增量同步。优先本地运行；不要扩展成内容改写、总结、SaaS 或云服务。
+description: 当用户要下载或管理微信公众号文章时使用本技能。支持三个场景：直接下载已知文章 URL；获取公众号历史文章并选择下载（默认 Exporter 模式，备选代理模式）；订阅多个公众号并定时增量同步。触发词：「下载公众号文章」「抓取公众号历史文章」「批量导出公众号」「订阅公众号定时同步」「下载 mp.weixin.qq.com」。不要用于：非 mp.weixin.qq.com 的内容、给定文本的普通总结/改写、或需要绕过登录/付费/私密的场景。优先本地运行；不要扩展成内容改写、总结、SaaS 或云服务。
 ---
 
 # Moore 微信公众号文章下载器
+
+## 第一步：自检（强制）
+
+任何流程之前，先跑只读预检，按 `ok` 与各 check 分支：
+
+```bash
+python3 {baseDir}/scripts/doctor.py            # 需联网探测时加 --check-network
+```
+
+返回 `{"ok": bool, "checks": [...], "next_step": "..."}` + 退出码（0 可用 / 1 有阻断）：
+- `ok:true` 即可做 URL 下载与 Exporter 模式（无需 mitmproxy）。
+- `mitmdump` 缺失 → 仅**代理历史模式**需要，引导安装（`capture` 前）。
+- `credential_store` 显示无系统凭据库 → Exporter 存 auth-key 时加 `--allow-plain-auth-key`。
+- `system_proxy` 显示代理已开 → 可能上次没还原，提醒先关闭。
 
 ## 场景判断
 
@@ -30,6 +44,24 @@ description: 当用户要下载或管理微信公众号文章时使用本技能�
 可以做：下载公开的 `mp.weixin.qq.com` 文章、抓取历史文章列表、Exporter 扫码登录和账号管理、定时增量同步。
 
 不要做：绕过登录/付费墙/私密内容；打印 auth-key/cookie/token；把历史列表抓取和 URL 下载混为一谈；扩展成内容改写、总结、SaaS。
+
+## 不能自动做什么（拒绝面）
+
+以下动作**只能由用户手动完成**，本技能不代劳（确认话术见 `references/manual-gates.md`）：
+
+- 不代替用户扫码登录，不采集、打印或保存 auth-key/cookie/token/pass_ticket。
+- 不静默安装或信任 mitmproxy 根证书——代理模式必须引导用户手动装并信任。
+- 不在未确认时启用系统代理；用完**必须**还原，绝不留代理开启。
+- 不绕过登录墙、付费、私密或已删除内容。
+- 不把历史列表抓取与 URL 下载混为一谈（两条不同路径）。
+
+## 领域纪律（微信数据模型的坑）
+
+- **历史列表 ≠ URL 下载**：抓「历史文章列表」是元数据枚举，和「按 URL 下载正文」是两条独立路径，命令与产物都不同，别混用。
+- **auth-key 约 4 天有效**：过期要重新扫码；扫码时必须选公众号/服务号，不要选小程序。
+- **同名候选**：`exporter-search` 可能返回多个同名公众号，必须让用户按 `fakeid`/昵称选一个再同步。
+- **列表必须先展示再选**：历史/Exporter 模式必须先在聊天中列出「标题 + 日期」，让用户选，不要自动全量下载。
+- **代理模式只抓滚过的**：只捕获用户在微信桌面端实际滚过的条目；要更多就继续滚。
 
 ## 场景 1：直接下载已知文章
 
@@ -179,6 +211,7 @@ Exporter 模式额外报告：auth-key 是否有效、公众号/文章数量、S
 
 - `references/backend-design.md`：两模式架构
 - `references/skill-cli-flow.md`：Skill 驱动 CLI 流程
+- `references/manual-gates.md`：人工 gate 与用户确认话术模板
 - `references/output-formats.md`：输出文件结构
 - `references/compliance.md`：安全和权限规则
 - `references/troubleshooting.md`：常见失败和处理

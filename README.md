@@ -107,9 +107,11 @@ pip install mitmproxy
 
 - [`SKILL.md`](SKILL.md) — 意图路由与场景定义
 - [`references/backend-design.md`](references/backend-design.md) — 架构设计
+- [`references/manual-gates.md`](references/manual-gates.md) — 人工 gate 与确认话术模板
 - [`references/output-formats.md`](references/output-formats.md) — 输出格式规范
 - [`references/troubleshooting.md`](references/troubleshooting.md) — 常见问题排查
 - [`references/compliance.md`](references/compliance.md) — 安全与权限说明
+- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) — 第三方依赖与参考项目署名
 
 ## License
 
