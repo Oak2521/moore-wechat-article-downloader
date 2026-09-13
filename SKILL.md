@@ -34,6 +34,9 @@ description: 当用户要下载或管理微信公众号文章时使用本技能�
 
 ## 执行护栏
 
+- **公开正文读取默认路径**：用户提供或任务需要读取公开文章 URL 时，直接用 wizard URL 模式；普通研究使用显式临时 `--runtime-dir`、`--output-dir` 和 `--no-assets`。该授权不包括登录、用户收藏/历史列表、系统代理、进程重置或定时任务。实际读取 `index.csv` 及 Markdown 首尾后才报告完整正文已取得；图片型正文另报缺失范围。
+- **新增代理与收藏功能仍需独立授权**：本文件中的代理命令及 `--yes` 示例只在用户明确批准对应系统代理变更、微信 WebView 进程重置和目标数据访问后使用。普通 URL 阅读不进入这些流程。
+
 - **不要把命令成功等同于交付完整**：`success_count` 只表示流程没有抛错。结束前必须检查 `index.csv`、Markdown、图片目录和源页面状态。
 - **不要只给二维码文件路径**：生成或复用二维码后优先调用当前操作系统的默认看图程序直接打开。只有无桌面环境或系统打开失败时，才退回聊天图片展示；裸路径只能作为最后兜底。同一未完成登录会话只打开一次，二维码过期后才重新生成。
 - **扫码流程不能少步骤**：用户说“已扫码”后先运行 `exporter-login-qr-status`；只有状态为 `confirmed` / `ready_to_complete=true` 才运行 `exporter-login-qr-complete`。
@@ -311,7 +314,7 @@ python3 {baseDir}/scripts/wechat_exporter.py exporter-download-new
 python3 {baseDir}/scripts/wechat_exporter.py exporter-daily-run
 ```
 
-设置 cron 定时任务时，用 AI 帮用户生成 launchd plist 或 crontab 条目，指定绝对路径调用 `exporter-daily-run`。
+用户明确要求定时同步时，使用原生 Codex automation 工具创建或更新任务，保存清晰的 `exporter-daily-run` 调用目标和绝对工作路径。不要生成 launchd plist 或 crontab 作为默认路径。首次登录、扫码、启用系统代理、访问用户专有列表以及其他既有 gate 保持原样；定时请求不构成这些动作的额外授权。
 
 ## Exporter 登录
 

@@ -1011,7 +1011,7 @@ def qr_login_status(base: Path, login_id: str) -> dict[str, Any]:
     }
 
 
-def complete_qr_login(base: Path, login_id: str, profile: str = "") -> dict[str, Any]:
+def complete_qr_login(base: Path, login_id: str, profile: str = "", allow_plain: bool = False) -> dict[str, Any]:
     session = load_qr_login_session(base, login_id)
     jar = login_cookie_jar(base, login_id)
     _raw, payload, set_cookies, _ctype = request_with_cookie_jar(
@@ -1028,7 +1028,7 @@ def complete_qr_login(base: Path, login_id: str, profile: str = "") -> dict[str,
         raise RuntimeError("auth-key was not returned by exporter bizlogin")
     nickname = str(payload.get("nickname") or payload.get("nick_name") or profile or "default")
     expires_at = str(payload.get("expires") or (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=4)).isoformat())
-    result = upsert_login_profile(base, str(session["base_url"]), auth_key, profile or nickname or "default", expires_at, False)
+    result = upsert_login_profile(base, str(session["base_url"]), auth_key, profile or nickname or "default", expires_at, allow_plain)
     db = connect_db(base)
     try:
         db.execute(
@@ -3849,7 +3849,7 @@ def command_login_qr_status(args: argparse.Namespace) -> int:
 
 
 def command_login_qr_complete(args: argparse.Namespace) -> int:
-    result = complete_qr_login(runtime_dir(args.runtime_dir), args.login_id, args.profile)
+    result = complete_qr_login(runtime_dir(args.runtime_dir), args.login_id, args.profile, args.allow_plain_auth_key)
     write_json_response(result)
     return 0
 
@@ -4805,6 +4805,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
     p.add_argument("login_id")
     p.add_argument("--profile", default="")
+    p.add_argument("--allow-plain-auth-key", action="store_true")
     p.set_defaults(func=command_login_qr_complete)
 
     p = sub.add_parser("exporter-config")
