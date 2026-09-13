@@ -29,14 +29,17 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
+    DEFAULT_PROXY_PORT,
+    active_proxy_port,
     build_history_open_url,
     choose_network_service,
-    delivery_dir,
     extract_urls,
     get_network_proxy_state,
     history_account_dir,
     make_run_id,
     open_history_link,
+    plan_markdown_account_groups,
+    run_markdown_only_download_by_account,
     run_markdown_only_download,
     runtime_dir,
     sanitize_text_urls,
@@ -55,6 +58,7 @@ DOWNLOAD_WORDS = ("下载", "保存", "导出")
 EXPORTER_WORDS = ("exporter", "公众号", "同步", "搜索")
 SYNC_WORDS = ("同步", "刷新", "更新")
 LIST_WORDS = ("列出", "列表", "让我选", "有哪些", "最近")
+ENGAGEMENT_WORDS = ("评论", "互动", "阅读", "阅读数", "点赞", "分享", "精选留言", "精选评论", "在看", "收藏数")
 SENSITIVE_TEXT_RE = re.compile(r"\b(auth-key|pass_ticket|appmsg_token|sessionid|token|cookie|uin|key)=\S+", re.I)
 DEFAULT_DOWNLOAD_PREFERENCES = {
     "output_dir": "",
@@ -655,6 +659,7 @@ def parse_intent(goal: str) -> dict[str, Any]:
     has_exporter_words = any(word.lower() in text.lower() for word in EXPORTER_WORDS)
     has_sync_words = any(word in text for word in SYNC_WORDS)
     has_list_words = any(word in text for word in LIST_WORDS)
+    has_engagement_words = any(word in text for word in ENGAGEMENT_WORDS)
     account_query = extract_account_query(text, urls) if has_download_words or has_exporter_words or has_sync_words or has_list_words else ""
     latest = None
     for marker in ("最新", "最近", "前"):
@@ -673,6 +678,7 @@ def parse_intent(goal: str) -> dict[str, Any]:
         "selection": "",
         "output_dir": "",
         "requires_user_choice": False,
+        "requires_engagement": has_engagement_words,
         "goal": text,
         "input_digest": goal_digest(text),
         "signals": {
@@ -681,6 +687,7 @@ def parse_intent(goal: str) -> dict[str, Any]:
             "has_exporter_words": has_exporter_words,
             "has_sync_words": has_sync_words,
             "has_list_words": has_list_words,
+            "has_engagement_words": has_engagement_words,
             "has_account_query": bool(account_query),
             "url_count": len(urls),
         },
@@ -830,7 +837,7 @@ def gate_environment(base: Path, task_id: str, output_dir: Path) -> dict[str, An
 
 
 def mitmdump_install_command() -> str:
-    return f"python3 {SCRIPT_DIR / 'wechat_downloader.py'} history-proxy-setup --port 8899 --install --yes"
+    return f"python3 {SCRIPT_DIR / 'wechat_downloader.py'} history-proxy-setup --port {DEFAULT_PROXY_PORT} --install --yes"
 
 
 def gate_history_environment(base: Path, task_id: str) -> dict[str, Any]:
@@ -946,8 +953,8 @@ def record_download_manifest(base: Path, task_id: str, source_mode: str, manifes
                     str(item.get("article_id") or ""),
                     sanitize_text_urls(str(item.get("source_url") or item.get("url") or "")),
                     str(item.get("status") or ("failed" if item.get("error") else "success")),
-                    str(item.get("markdown_path") or ""),
-                    str(item.get("image_dir") or ""),
+                    str(item.get("absolute_markdown_path") or item.get("markdown_path") or ""),
+                    str(item.get("absolute_image_dir") or item.get("image_dir") or ""),
                     scrub_sensitive_text(str(item.get("error") or "")),
                     int(item.get("retries") or 0),
                     str(item.get("previous_run_id") or ""),
@@ -1001,6 +1008,9 @@ def previous_success_records(base: Path, task_id: str, urls: list[str]) -> dict[
             previous_markdown_path = previous_markdown
             if previous_markdown and previous_output_dir and not Path(previous_markdown).is_absolute():
                 previous_markdown_path = str(Path(previous_output_dir) / previous_markdown)
+            previous_markdown_exists = bool(previous_markdown_path and Path(previous_markdown_path).exists())
+            if not previous_markdown_exists:
+                continue
             records[url] = {
                 "source_url": url,
                 "previous_run_id": str(row["run_id"] or ""),
@@ -1008,7 +1018,7 @@ def previous_success_records(base: Path, task_id: str, urls: list[str]) -> dict[
                 "previous_output_dir": previous_output_dir,
                 "previous_markdown_path": previous_markdown_path,
                 "previous_image_dir": str(row["image_dir"] or ""),
-                "previous_markdown_exists": bool(previous_markdown_path and Path(previous_markdown_path).exists()),
+                "previous_markdown_exists": previous_markdown_exists,
             }
         return records
     finally:
@@ -1124,6 +1134,32 @@ def verify_run(output_dir: Path, manifest: dict[str, Any], base: Path | None = N
     errors_path = output_dir / "errors.json"
     markdown_files = list((output_dir / "articles").glob("*.md"))
     success_count = int(manifest.get("success_count") or 0)
+    if manifest.get("profile") == "markdown-only-multi-account":
+        result_indexes = [Path(str(item.get("index") or "")) for item in manifest.get("results", []) if item.get("index")]
+        index_ok = all(path.exists() for path in result_indexes)
+        expected_markdown = [
+            Path(str(item.get("absolute_markdown_path") or ""))
+            for item in list(manifest.get("articles") or [])
+            if str(item.get("absolute_markdown_path") or "")
+        ]
+        markdown_ok = all(path.exists() for path in expected_markdown) if expected_markdown else success_count == 0
+        articles_json_ok = json_file_is_type(articles_path, list)
+        errors_json_ok = json_file_is_type(errors_path, list)
+        skipped = list(manifest.get("skipped") or [])
+        skipped_evidence_ok = all(skipped_item_has_evidence(output_dir, item, base) for item in skipped)
+        ok = run_path.exists() and articles_json_ok and errors_json_ok and index_ok and markdown_ok and skipped_evidence_ok
+        return {
+            "ok": ok,
+            "index_exists": index_ok,
+            "run_json_exists": run_path.exists(),
+            "articles_json_ok": articles_json_ok,
+            "errors_json_ok": errors_json_ok,
+            "markdown_count": len(expected_markdown),
+            "expected_markdown_count": len(expected_markdown),
+            "success_count": success_count,
+            "skipped_count": len(skipped),
+            "skipped_evidence_ok": skipped_evidence_ok,
+        }
     expected_markdown = [
         output_dir / str(item.get("markdown_path") or "")
         for item in list(manifest.get("articles") or [])
@@ -1162,7 +1198,11 @@ def run_url_mode(
     force_source: str = "none",
 ) -> dict[str, Any]:
     run_id = make_run_id()
-    out_dir = delivery_dir(output_dir_arg, run_id) if output_dir_arg else (DEFAULT_DELIVERY_DIR / run_id).expanduser().resolve()
+    groups = plan_markdown_account_groups(intent["urls"], output_dir_arg)
+    if len(groups) == 1:
+        out_dir = Path(str(groups[0]["output_dir"])).expanduser().resolve()
+    else:
+        out_dir = Path(output_dir_arg).expanduser().resolve() if output_dir_arg else DEFAULT_DELIVERY_DIR.expanduser().resolve()
     env_gate = gate_environment(base, task_id, out_dir)
     if not env_gate["ok"]:
         save_task(base, task_id, intent, env_gate["state"], "url", str(out_dir), env_gate)
@@ -1189,7 +1229,8 @@ def run_url_mode(
         return result
 
     owner = f"{task_id}:{os.getpid()}"
-    lock_name = "download:" + hashlib.sha256(str(out_dir).encode("utf-8")).hexdigest()[:16]
+    lock_scope_dir = Path(output_dir_arg).expanduser().resolve() if output_dir_arg else out_dir
+    lock_name = "download:" + hashlib.sha256(str(lock_scope_dir).encode("utf-8")).hexdigest()[:16]
     lock = acquire_lock(base, lock_name, owner)
     if not lock["ok"]:
         event = record_gate(base, task_id, "download", "failed_recoverable", False, lock, "download output directory is locked")
@@ -1201,9 +1242,9 @@ def run_url_mode(
     try:
         started_monotonic = time.monotonic()
         started_at = utc_now()
-        manifest = run_markdown_only_download(
+        manifest = run_markdown_only_download_by_account(
             urls_to_download,
-            out_dir,
+            output_dir_arg,
             not no_assets,
             {"mode": "wechat-wizard-url", "task_id": task_id, "urls": urls_to_download, "goal": intent["goal"]},
             run_id,
@@ -1238,10 +1279,12 @@ def run_url_mode(
             out_dir.mkdir(parents=True, exist_ok=True)
             (out_dir / "articles").mkdir(parents=True, exist_ok=True)
             (out_dir / "images").mkdir(parents=True, exist_ok=True)
-            (out_dir / "index.csv").write_text(
-                "seq,article_id,title,account,source_url,markdown_path,image_dir,image_count,status,error\n",
-                encoding="utf-8",
-            )
+            index_path = out_dir / "index.csv"
+            if not index_path.exists():
+                index_path.write_text(
+                    "seq,article_id,title,account,source_url,markdown_path,image_dir,image_count,status,error\n",
+                    encoding="utf-8",
+                )
         extra_files = write_wizard_run_files(out_dir, task_id, intent, manifest)
         verification = verify_run(out_dir, manifest, base)
         verify_gate = record_gate(base, task_id, "verify", "done" if verification["ok"] else "failed_recoverable", verification["ok"], verification)
@@ -1432,9 +1475,7 @@ def active_qr_login_session(base: Path, task_id: str = "") -> dict[str, Any] | N
             continue
         if task_id and str(session.get("task_id") or "") != task_id:
             continue
-        status = str(session.get("status") or "")
-        expires_at = parse_iso_time(str(session.get("expires_at") or ""))
-        if status in {"waiting_for_scan", "scanned_waiting_confirm"} and expires_at and expires_at > now:
+        if wechat_exporter.is_reusable_qr_login_session(session, now=now):
             return session
     return None
 
@@ -1467,13 +1508,13 @@ def gate_exporter_auth(base: Path, task_id: str, required: bool) -> dict[str, An
     qr_auto_disabled = os.environ.get("MOORE_WECHAT_WIZARD_DISABLE_QR_AUTO") == "1"
     if not qr_session and not qr_auto_disabled:
         try:
-            started = wechat_exporter.start_qr_login(base, base_url)
+            started = wechat_exporter.start_qr_login(base, base_url, open_qrcode=True)
             qr_session = {
                 "login_id": started.get("login_id", ""),
                 "base_url": started.get("base_url", base_url),
                 "qrcode_path": started.get("qrcode_path", ""),
                 "expires_at": started.get("expires_at", ""),
-                "status": "waiting_for_scan",
+                "status": started.get("status", "waiting_for_scan"),
                 "task_id": task_id,
             }
             try:
@@ -1651,8 +1692,35 @@ def run_exporter_mode(base: Path, task_id: str, intent: dict[str, Any], output_d
         save_task(base, task_id, intent, "ready", "exporter", result=result)
         return result
 
+    if intent.get("requires_engagement"):
+        engagement = wechat_exporter.sync_engagement_for_articles(base, account_id, selected_ids, output_root=output_dir_arg)
+        state = "waiting_wechat_collection" if engagement.get("status") == "waiting_credential" else ("done" if engagement.get("ok") else "failed_recoverable")
+        result = {
+            "ok": bool(engagement.get("ok") or engagement.get("status") == "waiting_credential"),
+            "state": state,
+            "task_id": task_id,
+            "mode": "exporter",
+            "account": compact_account(dict(wechat_exporter.get_account_row(base, account_id=account_id))),
+            "selected_article_ids": selected_ids,
+            "download": None,
+            "engagement": engagement,
+            "flow": "exporter-sync -> engagement batch download",
+        }
+        if engagement.get("status") == "waiting_credential":
+            result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
+        record_gate(base, task_id, "engagement", state, bool(result["ok"]), engagement)
+        save_task(base, task_id, intent, state, "exporter", output_dir_arg, result)
+        return result
+
     nickname = account.get("nickname", "") if not output_dir_arg else ""
-    downloaded = wechat_exporter.download_articles(base, selected_ids, output_dir_arg, no_assets, nickname)
+    downloaded = wechat_exporter.download_articles(
+        base,
+        selected_ids,
+        output_dir_arg,
+        no_assets,
+        nickname,
+        force=True,
+    )
     result = {
         "ok": downloaded.get("ok", False),
         "state": "done" if downloaded.get("ok") else "failed_recoverable",
@@ -1753,7 +1821,7 @@ def run_history_mode(base: Path, task_id: str, intent: dict[str, Any], dry_run: 
                 "session_id": open_result["session_id"],
                 "mitmdump_available": bool(history_env_gate["evidence"].get("mitmdump_available")),
                 "mitmdump_path": str(history_env_gate["evidence"].get("mitmdump_path") or ""),
-                "proxy_port": 8899,
+                "proxy_port": DEFAULT_PROXY_PORT,
                 "open_url_type": open_result.get("open_url_type", ""),
             },
         )
@@ -1884,8 +1952,37 @@ def resume_article_choice(
         }
         save_task(base, task_id, task["intent"], "ready", "exporter", result=result)
         return result
+
+    if (task.get("intent") or {}).get("requires_engagement"):
+        engagement = wechat_exporter.sync_engagement_for_articles(base, account_id, selected_ids, output_root=output_dir)
+        state = "waiting_wechat_collection" if engagement.get("status") == "waiting_credential" else ("done" if engagement.get("ok") else "failed_recoverable")
+        result = {
+            "ok": bool(engagement.get("ok") or engagement.get("status") == "waiting_credential"),
+            "state": state,
+            "task_id": task_id,
+            "mode": "exporter",
+            "resumed_from": "need_article_choice",
+            "account": account,
+            "selected_article_ids": selected_ids,
+            "download": None,
+            "engagement": engagement,
+            "flow": "exporter-sync -> engagement batch download",
+        }
+        if engagement.get("status") == "waiting_credential":
+            result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
+        record_gate(base, task_id, "engagement", state, bool(result["ok"]), engagement)
+        save_task(base, task_id, task["intent"], state, "exporter", output_dir, result)
+        return result
+
     nickname = str(account.get("nickname", "")) if not output_dir else ""
-    downloaded = wechat_exporter.download_articles(base, selected_ids, output_dir, no_assets, nickname)
+    downloaded = wechat_exporter.download_articles(
+        base,
+        selected_ids,
+        output_dir,
+        no_assets,
+        nickname,
+        force=True,
+    )
     state = "done" if downloaded.get("ok") else "failed_recoverable"
     manifest = exporter_download_manifest(base, selected_ids, downloaded)
     record_download_manifest(base, task_id, "exporter", manifest, state)
@@ -1904,6 +2001,33 @@ def resume_article_choice(
     return result
 
 
+def resume_wechat_collection(base: Path, task_id: str, task: dict[str, Any]) -> dict[str, Any]:
+    previous = dict(task.get("result") or {})
+    engagement = dict(previous.get("engagement") or {})
+    run_id = str(engagement.get("run_id") or "")
+    biz = str((engagement.get("biz") or "") or "")
+    if not biz and run_id:
+        run, _contexts = wechat_exporter.contexts_for_engagement_run(base, run_id)
+        if run:
+            scope = wechat_exporter.load_json_text(str(run.get("scope_json") or "{}")) or {}
+            biz = str(scope.get("biz") or "")
+    resumed = wechat_exporter.resume_waiting_engagement_runs(base, biz, run_id)
+    state = "done" if resumed.get("ok") else "waiting_wechat_collection"
+    result = {
+        **previous,
+        "ok": bool(resumed.get("ok")),
+        "state": state,
+        "task_id": task_id,
+        "mode": "exporter",
+        "resumed_from": "waiting_wechat_collection",
+        "engagement_resume": resumed,
+    }
+    if not resumed.get("ok"):
+        result["next_step"] = "请确认代表文章已在微信客户端打开并加载评论区，然后再次恢复本任务。"
+    save_task(base, task_id, dict(task["intent"]), state, "exporter", str(previous.get("output_dir") or ""), result)
+    return result
+
+
 def resume_task(args: argparse.Namespace) -> int:
     base = runtime_dir(args.runtime_dir)
     task = load_task(base, args.task_id)
@@ -1918,6 +2042,8 @@ def resume_task(args: argparse.Namespace) -> int:
             result = run_exporter_mode(base, args.task_id, dict(task["intent"]), options["output_dir"], options["no_assets"], args.dry_run)
             result["resumed_from"] = "need_login"
             save_task(base, args.task_id, dict(task["intent"]), str(result.get("state") or "need_login"), "exporter", str(result.get("output_dir") or ""), result)
+        elif state == "waiting_wechat_collection":
+            result = resume_wechat_collection(base, args.task_id, task)
         else:
             result = {
                 "ok": False,
@@ -2279,7 +2405,27 @@ def saved_proxy_state_matches(saved: dict[str, Any], service: str, endpoint: str
     return saved_service == service and normalize_proxy_endpoint(f"{host}:{port}") == normalize_proxy_endpoint(endpoint)
 
 
-def check_system_proxy_recoverability(base: Path, port: int = 8899) -> dict[str, Any]:
+def current_project_proxy_ports(base: Path, default_port: int = DEFAULT_PROXY_PORT) -> list[int]:
+    ports: list[int] = []
+    try:
+        if default_port:
+            ports.append(int(default_port))
+    except (TypeError, ValueError):
+        pass
+    try:
+        active = active_proxy_port(base)
+        if active:
+            ports.append(int(active))
+    except Exception:
+        pass
+    deduped: list[int] = []
+    for item in ports:
+        if item not in deduped:
+            deduped.append(item)
+    return deduped
+
+
+def check_system_proxy_recoverability(base: Path, port: int = DEFAULT_PROXY_PORT) -> dict[str, Any]:
     state_path = system_proxy_state_path(base)
     saved_state_exists = state_path.exists()
     saved_state = load_system_proxy_restore_state(state_path)
@@ -2307,10 +2453,14 @@ def check_system_proxy_recoverability(base: Path, port: int = 8899) -> dict[str,
 
     web_endpoint = proxy_endpoint(state.get("web", {}))
     secure_endpoint = proxy_endpoint(state.get("secure_web", {}))
-    local_proxy = f"127.0.0.1:{port}"
-    local_alias = f"localhost:{port}"
-    points_to_history_proxy = web_endpoint in {local_proxy, local_alias} or secure_endpoint in {local_proxy, local_alias}
-    matching_endpoint = web_endpoint if web_endpoint in {local_proxy, local_alias} else secure_endpoint
+    monitored_ports = current_project_proxy_ports(base, port)
+    monitored_endpoints = {
+        endpoint
+        for item in monitored_ports
+        for endpoint in (f"127.0.0.1:{item}", f"localhost:{item}")
+    }
+    points_to_history_proxy = web_endpoint in monitored_endpoints or secure_endpoint in monitored_endpoints
+    matching_endpoint = web_endpoint if web_endpoint in monitored_endpoints else secure_endpoint
     saved_state_matches = bool(points_to_history_proxy and saved_proxy_state_matches(saved_state, service, matching_endpoint))
     ok = not points_to_history_proxy or saved_state_matches
     recoverability = "not_needed"
@@ -2331,6 +2481,7 @@ def check_system_proxy_recoverability(base: Path, port: int = 8899) -> dict[str,
         "web_proxy": web_endpoint,
         "secure_web_proxy": secure_endpoint,
         "points_to_history_proxy": points_to_history_proxy,
+        "monitored_ports": monitored_ports,
         "saved_state_exists": saved_state_exists,
         "saved_state_matches": saved_state_matches,
         "recoverability": recoverability,

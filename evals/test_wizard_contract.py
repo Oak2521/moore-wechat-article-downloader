@@ -34,6 +34,17 @@ class WizardContractTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="moore-wizard-test-"))
 
     def tearDown(self) -> None:
+        context_dir = self.tmp / "context"
+        if context_dir.exists():
+            for state_path in context_dir.glob("*.proxy.json"):
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    pid = int(state.get("pid") or 0)
+                    port = int(state.get("port") or 0)
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    continue
+                if pid and port:
+                    wechat_downloader.stop_proxy_process(pid, port)
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def run_cli(self, *args: str, allow_fail: bool = False, extra_env: dict[str, str] | None = None) -> tuple[int, dict]:
@@ -122,6 +133,252 @@ class WizardContractTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_choose_proxy_port_stays_inside_random_range(self) -> None:
+        selected = wechat_downloader.choose_proxy_port()
+        self.assertGreaterEqual(selected, wechat_downloader.PROXY_PORT_MIN)
+        self.assertLessEqual(selected, wechat_downloader.PROXY_PORT_MAX)
+        self.assertTrue(wechat_downloader.proxy_port_available(selected))
+
+    def test_choose_proxy_port_rejects_out_of_range_override(self) -> None:
+        with self.assertRaises(ValueError):
+            wechat_downloader.choose_proxy_port(8899)
+
+    def test_resolve_proxy_port_reads_active_session(self) -> None:
+        wechat_downloader.write_json(
+            wechat_downloader.active_proxy_session_path(self.tmp),
+            {"session_id": "proxy-enhancer-test", "pid": 1234, "port": 23555, "mode": "proxy-enhancer"},
+        )
+        original_running = wechat_downloader.history_proxy_process_running
+        try:
+            wechat_downloader.history_proxy_process_running = lambda pid, port: pid == 1234 and port == 23555
+            self.assertEqual(wechat_downloader.resolve_proxy_port(self.tmp, require_active=True), 23555)
+        finally:
+            wechat_downloader.history_proxy_process_running = original_running
+
+    def test_resolve_proxy_port_rejects_out_of_range_override(self) -> None:
+        with self.assertRaises(ValueError):
+            wechat_downloader.resolve_proxy_port(self.tmp, 8899)
+
+    def test_proxy_enhancer_session_start_uses_selected_port_and_fixed_upstream(self) -> None:
+        original_choose = wechat_downloader.choose_proxy_port
+        original_resolve = wechat_downloader.resolve_upstream_proxy
+        original_start = wechat_downloader.start_proxy_enhancer
+        original_enable = wechat_downloader.enable_system_proxy
+        original_status = wechat_downloader.status_proxy_enhancer
+        original_active = wechat_downloader.active_proxy_port
+        original_reset = wechat_downloader.reset_wechat_webview_process
+        calls: dict[str, object] = {}
+        try:
+            wechat_downloader.active_proxy_port = lambda base: None
+            wechat_downloader.reset_wechat_webview_process = lambda: {"ok": True, "found": False}
+            wechat_downloader.choose_proxy_port = lambda port=None: 23555
+            wechat_downloader.resolve_upstream_proxy = lambda value, port, base=None: "http://127.0.0.1:10808"
+            wechat_downloader.start_proxy_enhancer = lambda base, port=None, upstream_proxy="auto": calls.update(
+                {"start_port": port, "start_upstream": upstream_proxy}
+            ) or {"ok": True, "pid": 1234, "port": port, "upstream_proxy": upstream_proxy}
+            wechat_downloader.enable_system_proxy = lambda base, service, host, port, yes: calls.update(
+                {"enable_port": port}
+            ) or {"ok": True}
+            wechat_downloader.status_proxy_enhancer = lambda base, port=None: {
+                "ok": True,
+                "running": True,
+                "port": port,
+                "system_proxy_points_here": True,
+            }
+            result = wechat_downloader.start_proxy_enhancer_session(self.tmp, None, "auto", True)
+        finally:
+            wechat_downloader.choose_proxy_port = original_choose
+            wechat_downloader.resolve_upstream_proxy = original_resolve
+            wechat_downloader.start_proxy_enhancer = original_start
+            wechat_downloader.enable_system_proxy = original_enable
+            wechat_downloader.status_proxy_enhancer = original_status
+            wechat_downloader.active_proxy_port = original_active
+            wechat_downloader.reset_wechat_webview_process = original_reset
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["port"], 23555)
+        self.assertEqual(calls["start_port"], 23555)
+        self.assertEqual(calls["start_upstream"], "http://127.0.0.1:10808")
+        self.assertEqual(calls["enable_port"], 23555)
+
+    def test_finish_proxy_enhancer_session_restores_then_stops_active_process(self) -> None:
+        state_path = wechat_downloader.session_proxy_state_path(self.tmp, "proxy-enhancer-test")
+        wechat_downloader.write_json(state_path, {"status": "running", "pid": 1234, "port": 23555})
+        wechat_downloader.write_json(
+            wechat_downloader.active_proxy_session_path(self.tmp),
+            {"session_id": "proxy-enhancer-test", "pid": 1234, "port": 23555, "state": str(state_path)},
+        )
+        original_disable = wechat_downloader.disable_system_proxy
+        original_stop = wechat_downloader.stop_proxy_process
+        events: list[str] = []
+        try:
+            wechat_downloader.disable_system_proxy = lambda base, yes=False: events.append("restore") or {"ok": True}
+            wechat_downloader.stop_proxy_process = lambda pid, port: events.append(f"stop:{pid}:{port}") or True
+            result = wechat_downloader.finish_proxy_enhancer_session(self.tmp, True)
+        finally:
+            wechat_downloader.disable_system_proxy = original_disable
+            wechat_downloader.stop_proxy_process = original_stop
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["restore", "stop:1234:23555"])
+        self.assertFalse(wechat_downloader.active_proxy_session_path(self.tmp).exists())
+
+    def test_proxy_enhancer_restart_preserves_active_port_and_upstream(self) -> None:
+        state = {"pid": 1234, "port": 23555, "upstream_proxy": "http://127.0.0.1:10808"}
+        original_resolve = wechat_downloader.resolve_proxy_port
+        original_running = wechat_downloader.running_history_proxy_on_port
+        original_points = wechat_downloader.system_proxy_points_to_port
+        original_service = wechat_downloader.choose_network_service
+        original_set = wechat_downloader.set_system_proxy_host_port
+        original_stop = wechat_downloader.stop_proxy_process
+        original_start = wechat_downloader.start_proxy_enhancer
+        original_reset = wechat_downloader.reset_wechat_webview_process
+        original_wait_port = wechat_downloader.wait_for_proxy_port_available
+        events: list[str] = []
+        try:
+            wechat_downloader.resolve_proxy_port = lambda base, port=None, require_active=False: 23555
+            wechat_downloader.running_history_proxy_on_port = lambda base, port: (dict(state), self.tmp / "proxy.json")
+            wechat_downloader.system_proxy_points_to_port = lambda service, host, port: True
+            wechat_downloader.choose_network_service = lambda service="": "Wi-Fi"
+            wechat_downloader.set_system_proxy_host_port = lambda service, host, port: events.append(
+                f"set:{host}:{port}"
+            ) or {"ok": True}
+            wechat_downloader.stop_proxy_process = lambda pid, port: events.append(f"stop:{pid}:{port}") or True
+            wechat_downloader.start_proxy_enhancer = lambda base, port=None, upstream_proxy="auto": events.append(
+                f"start:{port}:{upstream_proxy}"
+            ) or {"ok": True, "pid": 5678, "port": port, "upstream_proxy": upstream_proxy}
+            wechat_downloader.reset_wechat_webview_process = lambda: events.append("reset:webview") or {"ok": True}
+            wechat_downloader.wait_for_proxy_port_available = lambda port, timeout=5.0: True
+
+            result = wechat_downloader.restart_proxy_enhancer_safely(self.tmp, None, "auto", True)
+        finally:
+            wechat_downloader.resolve_proxy_port = original_resolve
+            wechat_downloader.running_history_proxy_on_port = original_running
+            wechat_downloader.system_proxy_points_to_port = original_points
+            wechat_downloader.choose_network_service = original_service
+            wechat_downloader.set_system_proxy_host_port = original_set
+            wechat_downloader.stop_proxy_process = original_stop
+            wechat_downloader.start_proxy_enhancer = original_start
+            wechat_downloader.reset_wechat_webview_process = original_reset
+            wechat_downloader.wait_for_proxy_port_available = original_wait_port
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["port"], 23555)
+        self.assertEqual(
+            events,
+            [
+                "set:127.0.0.1:10808",
+                "stop:1234:23555",
+                "start:23555:http://127.0.0.1:10808",
+                "set:127.0.0.1:23555",
+                "reset:webview",
+            ],
+        )
+
+    def test_proxy_enhancer_restart_direct_restores_before_stopping(self) -> None:
+        state = {"pid": 1234, "port": 23555, "upstream_proxy": ""}
+        original_resolve = wechat_downloader.resolve_proxy_port
+        original_running = wechat_downloader.running_history_proxy_on_port
+        original_points = wechat_downloader.system_proxy_points_to_port
+        original_service = wechat_downloader.choose_network_service
+        original_saved = wechat_downloader.saved_previous_proxy_endpoint
+        original_disable = wechat_downloader.disable_system_proxy
+        original_set = wechat_downloader.set_system_proxy_host_port
+        original_stop = wechat_downloader.stop_proxy_process
+        original_start = wechat_downloader.start_proxy_enhancer
+        original_reset = wechat_downloader.reset_wechat_webview_process
+        original_wait_port = wechat_downloader.wait_for_proxy_port_available
+        events: list[str] = []
+        try:
+            wechat_downloader.resolve_proxy_port = lambda base, port=None, require_active=False: 23555
+            wechat_downloader.running_history_proxy_on_port = lambda base, port: (dict(state), self.tmp / "proxy.json")
+            wechat_downloader.system_proxy_points_to_port = lambda service, host, port: True
+            wechat_downloader.choose_network_service = lambda service="": "Wi-Fi"
+            wechat_downloader.saved_previous_proxy_endpoint = lambda base: None
+            wechat_downloader.disable_system_proxy = lambda base, service="", yes=False: events.append("restore:direct") or {"ok": True}
+            wechat_downloader.set_system_proxy_host_port = lambda service, host, port: events.append(
+                f"set:{host}:{port}"
+            ) or {"ok": True}
+            wechat_downloader.stop_proxy_process = lambda pid, port: events.append(f"stop:{pid}:{port}") or True
+            wechat_downloader.start_proxy_enhancer = lambda base, port=None, upstream_proxy="auto": events.append(
+                f"start:{port}:{upstream_proxy}"
+            ) or {"ok": True, "pid": 5678, "port": port, "upstream_proxy": ""}
+            wechat_downloader.reset_wechat_webview_process = lambda: events.append("reset:webview") or {"ok": True}
+            wechat_downloader.wait_for_proxy_port_available = lambda port, timeout=5.0: True
+
+            result = wechat_downloader.restart_proxy_enhancer_safely(self.tmp, None, "auto", True)
+        finally:
+            wechat_downloader.resolve_proxy_port = original_resolve
+            wechat_downloader.running_history_proxy_on_port = original_running
+            wechat_downloader.system_proxy_points_to_port = original_points
+            wechat_downloader.choose_network_service = original_service
+            wechat_downloader.saved_previous_proxy_endpoint = original_saved
+            wechat_downloader.disable_system_proxy = original_disable
+            wechat_downloader.set_system_proxy_host_port = original_set
+            wechat_downloader.stop_proxy_process = original_stop
+            wechat_downloader.start_proxy_enhancer = original_start
+            wechat_downloader.reset_wechat_webview_process = original_reset
+            wechat_downloader.wait_for_proxy_port_available = original_wait_port
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            events,
+            ["restore:direct", "stop:1234:23555", "start:23555:none", "set:127.0.0.1:23555", "reset:webview"],
+        )
+
+    def test_wechat_webview_process_ids_include_only_root_and_descendants(self) -> None:
+        rows = [
+            {"pid": 10, "ppid": 1, "command": "/Applications/WeChat.app/Contents/MacOS/WeChat"},
+            {"pid": 11, "ppid": 10, "command": wechat_downloader.WECHAT_WEBVIEW_EXECUTABLE + " --log-level=2"},
+            {"pid": 12, "ppid": 11, "command": "/Applications/WeChat.app/Helpers/WeChatAppEx Helper --type=network"},
+            {"pid": 13, "ppid": 12, "command": "/Applications/WeChat.app/Helpers/renderer"},
+            {"pid": 20, "ppid": 1, "command": "/usr/bin/other"},
+        ]
+        self.assertEqual(wechat_downloader.wechat_webview_process_ids(rows), [11, 12, 13])
+
+    def test_reset_wechat_webview_process_terminates_old_tree(self) -> None:
+        original_platform = wechat_downloader.sys.platform
+        original_ids = wechat_downloader.wechat_webview_process_ids
+        original_kill = wechat_downloader.os.kill
+        signaled: list[tuple[int, int]] = []
+        try:
+            wechat_downloader.sys.platform = "darwin"
+            wechat_downloader.wechat_webview_process_ids = lambda rows=None: [] if signaled else [11, 12, 13]
+            wechat_downloader.os.kill = lambda pid, sig: signaled.append((pid, sig))
+            result = wechat_downloader.reset_wechat_webview_process()
+        finally:
+            wechat_downloader.sys.platform = original_platform
+            wechat_downloader.wechat_webview_process_ids = original_ids
+            wechat_downloader.os.kill = original_kill
+        self.assertTrue(result["ok"])
+        self.assertEqual([pid for pid, _sig in signaled], [13, 12, 11])
+
+    def test_disabled_proxy_state_drops_stale_endpoint(self) -> None:
+        normalized = wechat_downloader.normalize_network_proxy_state(
+            {
+                "service": "Wi-Fi",
+                "web": {"enabled_bool": False, "server": "127.0.0.1", "port": "8899"},
+                "secure_web": {"enabled_bool": True, "server": "127.0.0.1", "port": "10808"},
+            }
+        )
+        self.assertEqual(normalized["web"]["server"], "")
+        self.assertEqual(normalized["web"]["port"], "")
+        self.assertEqual(normalized["secure_web"]["port"], "10808")
+
+    def test_saved_proxy_state_drops_disabled_stale_endpoint(self) -> None:
+        state_path = wechat_downloader.system_proxy_state_path(self.tmp)
+        wechat_downloader.write_json(
+            state_path,
+            {
+                "service": "Wi-Fi",
+                "previous": {
+                    "web": {"enabled_bool": False, "server": "127.0.0.1", "port": "8899"},
+                    "secure_web": {"enabled_bool": False, "server": "127.0.0.1", "port": "8899"},
+                },
+            },
+        )
+        result = wechat_downloader.normalize_saved_system_proxy_state(self.tmp)
+        saved = wechat_downloader.read_json(state_path)
+        self.assertTrue(result["changed"])
+        self.assertEqual(saved["previous"]["web"]["server"], "")
+        self.assertEqual(saved["previous"]["web"]["port"], "")
+
     def test_url_goal_dry_run_persists_task_and_gates(self) -> None:
         code, payload = self.run_cli(
             "run",
@@ -161,16 +418,50 @@ class WizardContractTests(unittest.TestCase):
         self.assertEqual(payload["state"], "done")
         self.assertEqual(payload["success_count"], 1)
         self.assertEqual(payload["failure_count"], 0)
-        self.assertTrue((output_dir / "index.csv").exists())
-        self.assertTrue((output_dir / "articles.json").exists())
-        self.assertTrue((output_dir / "errors.json").exists())
-        run_json = json.loads((output_dir / "run.json").read_text(encoding="utf-8"))
+        actual_output_dir = Path(payload["output_dir"])
+        self.assertTrue((actual_output_dir / "index.csv").exists())
+        self.assertTrue((actual_output_dir / "articles.json").exists())
+        self.assertTrue((actual_output_dir / "errors.json").exists())
+        run_json = json.loads(Path(payload["run_json"]).read_text(encoding="utf-8"))
         self.assertEqual(run_json["success_count"], 1)
-        markdown_files = sorted((output_dir / "articles").glob("*.md"))
+        markdown_files = sorted((actual_output_dir / "articles").glob("*.md"))
         self.assertEqual(len(markdown_files), 1)
+        self.assertIn("[图文]", markdown_files[0].name)
         markdown = markdown_files[0].read_text(encoding="utf-8")
+        self.assertIn('title: "[图文]', markdown)
+        self.assertIn('content_type: "图文"', markdown)
         self.assertIn("离线 fixture 文章正文", markdown)
         self.assertIn("测试公众号", markdown)
+
+    def test_url_goal_extracts_content_noencode_without_wechat_shell(self) -> None:
+        output_dir = self.tmp / "content-noencode-output"
+        _code, payload = self.run_cli(
+            "run",
+            "下载这篇公众号文章：https://mp.weixin.qq.com/s/demo-url-article-content-noencode",
+            "--output-dir",
+            str(output_dir),
+            "--no-assets",
+            extra_env={"MOORE_WECHAT_HTML_FIXTURE_DIR": str(HTML_FIXTURES)},
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["success_count"], 1)
+        markdown_files = sorted((Path(payload["output_dir"]) / "articles").glob("*.md"))
+        self.assertEqual(len(markdown_files), 1)
+        self.assertIn("[贴图]", markdown_files[0].name)
+        markdown = markdown_files[0].read_text(encoding="utf-8")
+        self.assertIn('title: "[贴图]贴图公众号正文提取测试"', markdown)
+        self.assertIn('content_type: "贴图"', markdown)
+        self.assertIn('item_show_type: "8"', markdown)
+        self.assertIn("## 图片", markdown)
+        self.assertIn("## 内容", markdown)
+        self.assertIn("## 隐藏字段正文", markdown)
+        self.assertIn("这是从 content_noencode 提取的完整正文。", markdown)
+        self.assertIn("Unicode：正文 🖼", markdown)
+        self.assertIn("![正文配图](https://mmbiz.qpic.cn/test.png)", markdown)
+        self.assertLess(markdown.index("![正文配图]"), markdown.index("这是从 content_noencode 提取的完整正文。"))
+        self.assertNotIn("微信扫一扫", markdown)
+        self.assertNotIn("小程序 赞 在看", markdown)
 
     def test_url_goal_downloads_multiple_articles_and_records_items(self) -> None:
         output_dir = self.tmp / "multi-output"
@@ -185,9 +476,10 @@ class WizardContractTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["success_count"], 2)
-        self.assertEqual(len(list((output_dir / "articles").glob("*.md"))), 2)
-        articles = json.loads((output_dir / "articles.json").read_text(encoding="utf-8"))
-        self.assertEqual([item["title"] for item in articles], ["离线单篇下载测试", "离线多篇下载测试"])
+        actual_output_dir = Path(payload["output_dir"])
+        self.assertEqual(len(list((actual_output_dir / "articles").glob("*.md"))), 2)
+        articles = json.loads(Path(payload["articles_json"]).read_text(encoding="utf-8"))
+        self.assertEqual([item["title"] for item in articles], ["[图文]离线单篇下载测试", "[图文]离线多篇下载测试"])
         db = sqlite3.connect(self.tmp / "wizard.sqlite")
         try:
             items = db.execute(
@@ -282,7 +574,7 @@ class WizardContractTests(unittest.TestCase):
         original = wechat_downloader.download_one_markdown_only
         attempts: dict[str, int] = {}
 
-        def fake_download(url: str, output_dir: Path, seq: str, download_assets: bool) -> dict:
+        def fake_download(url: str, output_dir: Path, seq: str, download_assets: bool, filename_stem: str = "") -> dict:
             attempts[url] = attempts.get(url, 0) + 1
             if url.endswith("/b") and attempts[url] == 1:
                 raise RuntimeError("temporary network failure")
@@ -485,6 +777,35 @@ class WizardContractTests(unittest.TestCase):
         self.assertEqual(payload["mode"], "exporter")
         self.assertEqual(len(payload["selected_article_ids"]), 2)
 
+    def test_exporter_engagement_request_skips_regular_download(self) -> None:
+        self.import_exporter_fixture_synced_today()
+        intent = wechat_wizard.parse_intent("下载「哥飞」最近 2 篇文章的评论和互动数据")
+        wechat_wizard.decide_mode(intent)
+        calls: list[str] = []
+        original_download = wechat_wizard.wechat_exporter.download_articles
+        original_engagement = wechat_wizard.wechat_exporter.sync_engagement_for_articles
+
+        def fail_download(*_args: object, **_kwargs: object) -> dict:
+            calls.append("download")
+            raise AssertionError("regular exporter download must not run for engagement requests")
+
+        def fake_engagement(_base: Path, _account_id: int, article_ids: list[int], **_kwargs: object) -> dict:
+            calls.append("engagement")
+            return {"ok": True, "status": "complete", "article_count": len(article_ids)}
+
+        try:
+            wechat_wizard.wechat_exporter.download_articles = fail_download
+            wechat_wizard.wechat_exporter.sync_engagement_for_articles = fake_engagement
+            result = wechat_wizard.run_exporter_mode(self.tmp, "task_engagement", intent, "", False, False)
+        finally:
+            wechat_wizard.wechat_exporter.download_articles = original_download
+            wechat_wizard.wechat_exporter.sync_engagement_for_articles = original_engagement
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["flow"], "exporter-sync -> engagement batch download")
+        self.assertIsNone(result["download"])
+        self.assertEqual(calls, ["engagement"])
+
     def test_exporter_stale_cache_requires_login_before_sync(self) -> None:
         data = json.loads(FIXTURE.read_text(encoding="utf-8"))
         account = wechat_exporter.upsert_account(self.tmp, wechat_exporter.normalize_account(data["account"]))["account"]
@@ -568,7 +889,7 @@ class WizardContractTests(unittest.TestCase):
     def test_exporter_auth_gate_starts_qr_login_session(self) -> None:
         original_start = wechat_wizard.wechat_exporter.start_qr_login
 
-        def fake_start_qr_login(base: Path, base_url: str) -> dict:
+        def fake_start_qr_login(base: Path, base_url: str, open_qrcode: bool = False) -> dict:
             qrcode_path = base / "login" / "fake-login.qrcode.png"
             qrcode_path.parent.mkdir(parents=True, exist_ok=True)
             qrcode_path.write_bytes(b"\x89PNG\r\n")
@@ -818,25 +1139,26 @@ class WizardContractTests(unittest.TestCase):
     def test_url_mode_skips_already_downloaded_for_same_task(self) -> None:
         task_id = "task_skip"
         url = "https://mp.weixin.qq.com/s/already"
+        previous_dir = self.tmp / "previous"
+        previous_article = previous_dir / "articles" / "previous.md"
+        previous_article.parent.mkdir(parents=True, exist_ok=True)
+        previous_article.write_text("already here\n", encoding="utf-8")
         wechat_wizard.record_download_manifest(
             self.tmp,
             task_id,
             "url",
             {
                 "run_id": "run_previous",
-                "output_dir": str(self.tmp / "previous"),
+                "output_dir": str(previous_dir),
                 "success_count": 1,
                 "failure_count": 0,
-                "articles": [{"source_url": url, "status": "success"}],
+                "articles": [{"source_url": url, "status": "success", "markdown_path": "articles/previous.md"}],
                 "failed": [],
             },
             "done",
         )
         intent = wechat_wizard.parse_intent(f"下载：{url}")
         wechat_wizard.decide_mode(intent)
-        existing_article = self.tmp / "out" / "articles" / "previous.md"
-        existing_article.parent.mkdir(parents=True, exist_ok=True)
-        existing_article.write_text("already here\n", encoding="utf-8")
 
         result = wechat_wizard.run_url_mode(self.tmp, task_id, intent, str(self.tmp / "out"), False, False)
 
@@ -844,7 +1166,7 @@ class WizardContractTests(unittest.TestCase):
         self.assertEqual(result["state"], "done")
         self.assertEqual(result["success_count"], 0)
         self.assertEqual(result["skipped_count"], 1)
-        run_json = json.loads((self.tmp / "out" / "run.json").read_text(encoding="utf-8"))
+        run_json = json.loads(Path(result["run_json"]).read_text(encoding="utf-8"))
         self.assertEqual(run_json["skipped_count"], 1)
         self.assertIn("duration_ms", run_json)
         self.assertEqual(run_json["html_fetch_count"], 0)
@@ -907,7 +1229,7 @@ class WizardContractTests(unittest.TestCase):
         finally:
             db.close()
         self.assertEqual(row, ("skipped", "already downloaded previously", url))
-        run_json = json.loads((self.tmp / "out" / "run.json").read_text(encoding="utf-8"))
+        run_json = json.loads(Path(result["run_json"]).read_text(encoding="utf-8"))
         self.assertTrue(run_json["gate_summary"]["latest"]["verify"]["ok"])
 
     def test_verify_run_requires_sidecar_json_and_skip_evidence(self) -> None:
@@ -1096,13 +1418,14 @@ class WizardContractTests(unittest.TestCase):
         original_platform = wechat_wizard.sys.platform
         original_choose = wechat_wizard.choose_network_service
         original_get = wechat_wizard.get_network_proxy_state
+        port = str(wechat_downloader.DEFAULT_PROXY_PORT)
         try:
             wechat_wizard.sys.platform = "darwin"
             wechat_wizard.choose_network_service = lambda service="": "Wi-Fi"
             wechat_wizard.get_network_proxy_state = lambda service: {
                 "service": service,
-                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": "8899"},
-                "secure_web": {"enabled_bool": True, "server": "127.0.0.1", "port": "8899"},
+                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": port},
+                "secure_web": {"enabled_bool": True, "server": "127.0.0.1", "port": port},
             }
 
             result = wechat_wizard.check_system_proxy_recoverability(self.tmp)
@@ -1119,10 +1442,11 @@ class WizardContractTests(unittest.TestCase):
         original_platform = wechat_wizard.sys.platform
         original_choose = wechat_wizard.choose_network_service
         original_get = wechat_wizard.get_network_proxy_state
+        port = wechat_downloader.DEFAULT_PROXY_PORT
         state_path = wechat_downloader.system_proxy_state_path(self.tmp)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(
-            json.dumps({"service": "Wi-Fi", "new": {"host": "127.0.0.1", "port": 8899}, "previous": {"web": {}, "secure_web": {}}}),
+            json.dumps({"service": "Wi-Fi", "new": {"host": "127.0.0.1", "port": port}, "previous": {"web": {}, "secure_web": {}}}),
             encoding="utf-8",
         )
         try:
@@ -1130,7 +1454,7 @@ class WizardContractTests(unittest.TestCase):
             wechat_wizard.choose_network_service = lambda service="": "Wi-Fi"
             wechat_wizard.get_network_proxy_state = lambda service: {
                 "service": service,
-                "web": {"enabled_bool": True, "server": "localhost", "port": "8899"},
+                "web": {"enabled_bool": True, "server": "localhost", "port": str(port)},
                 "secure_web": {"enabled_bool": False, "server": "", "port": "0"},
             }
 
@@ -1147,10 +1471,46 @@ class WizardContractTests(unittest.TestCase):
         self.assertEqual(result["recoverability"], "saved_state")
         self.assertIn("history-proxy-disable", result["next_action"])
 
+    def test_doctor_system_proxy_marks_active_random_proxy_recoverable(self) -> None:
+        original_platform = wechat_wizard.sys.platform
+        original_choose = wechat_wizard.choose_network_service
+        original_get = wechat_wizard.get_network_proxy_state
+        original_active = wechat_wizard.active_proxy_port
+        port = 23555
+        state_path = wechat_downloader.system_proxy_state_path(self.tmp)
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps({"service": "Wi-Fi", "new": {"host": "127.0.0.1", "port": port}, "previous": {"web": {}, "secure_web": {}}}),
+            encoding="utf-8",
+        )
+        try:
+            wechat_wizard.sys.platform = "darwin"
+            wechat_wizard.choose_network_service = lambda service="": "Wi-Fi"
+            wechat_wizard.active_proxy_port = lambda base: port
+            wechat_wizard.get_network_proxy_state = lambda service: {
+                "service": service,
+                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": str(port)},
+                "secure_web": {"enabled_bool": False, "server": "", "port": "0"},
+            }
+
+            result = wechat_wizard.check_system_proxy_recoverability(self.tmp)
+        finally:
+            wechat_wizard.sys.platform = original_platform
+            wechat_wizard.choose_network_service = original_choose
+            wechat_wizard.get_network_proxy_state = original_get
+            wechat_wizard.active_proxy_port = original_active
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["points_to_history_proxy"])
+        self.assertIn(port, result["monitored_ports"])
+        self.assertTrue(result["saved_state_matches"])
+        self.assertEqual(result["recoverability"], "saved_state")
+
     def test_doctor_system_proxy_does_not_trust_stale_saved_state(self) -> None:
         original_platform = wechat_wizard.sys.platform
         original_choose = wechat_wizard.choose_network_service
         original_get = wechat_wizard.get_network_proxy_state
+        port = str(wechat_downloader.DEFAULT_PROXY_PORT)
         state_path = wechat_downloader.system_proxy_state_path(self.tmp)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(
@@ -1162,7 +1522,7 @@ class WizardContractTests(unittest.TestCase):
             wechat_wizard.choose_network_service = lambda service="": "Wi-Fi"
             wechat_wizard.get_network_proxy_state = lambda service: {
                 "service": service,
-                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": "8899"},
+                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": port},
                 "secure_web": {"enabled_bool": False, "server": "", "port": "0"},
             }
 
@@ -1183,10 +1543,11 @@ class WizardContractTests(unittest.TestCase):
         original_platform = wechat_wizard.sys.platform
         original_choose = wechat_wizard.choose_network_service
         original_get = wechat_wizard.get_network_proxy_state
+        port = wechat_downloader.DEFAULT_PROXY_PORT
         state_path = wechat_downloader.system_proxy_state_path(self.tmp)
         state_path.parent.mkdir(parents=True, exist_ok=True)
         state_path.write_text(
-            json.dumps({"service": "Wi-Fi", "new": {"host": "127.0.0.1", "port": 8899}, "previous": {}}),
+            json.dumps({"service": "Wi-Fi", "new": {"host": "127.0.0.1", "port": port}, "previous": {}}),
             encoding="utf-8",
         )
         try:
@@ -1194,7 +1555,7 @@ class WizardContractTests(unittest.TestCase):
             wechat_wizard.choose_network_service = lambda service="": "Wi-Fi"
             wechat_wizard.get_network_proxy_state = lambda service: {
                 "service": service,
-                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": "8899"},
+                "web": {"enabled_bool": True, "server": "127.0.0.1", "port": str(port)},
                 "secure_web": {"enabled_bool": False, "server": "", "port": "0"},
             }
 
@@ -1354,12 +1715,15 @@ class WizardContractTests(unittest.TestCase):
                 "log": str(self.tmp / "old.proxy.log"),
             },
         )
-        original_process_running = wechat_downloader.process_running
+        original_proxy_running = wechat_downloader.history_proxy_process_running
+        original_resolve_upstream = wechat_downloader.resolve_upstream_proxy
         try:
-            wechat_downloader.process_running = lambda pid: int(pid) == 1234
+            wechat_downloader.history_proxy_process_running = lambda pid, port: int(pid) == 1234 and int(port) == 8899
+            wechat_downloader.resolve_upstream_proxy = lambda value, port, base=None: "http://127.0.0.1:10808"
             result = wechat_downloader.start_history_proxy(self.tmp, new_session, 8899, 100, "auto")
         finally:
-            wechat_downloader.process_running = original_process_running
+            wechat_downloader.history_proxy_process_running = original_proxy_running
+            wechat_downloader.resolve_upstream_proxy = original_resolve_upstream
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["reused_existing_proxy"])
@@ -1387,12 +1751,12 @@ class WizardContractTests(unittest.TestCase):
             "http://127.0.0.1:10808",
             wechat_downloader.session_proxy_state_path(self.tmp, "new-session"),
         )
-        original_process_running = wechat_downloader.process_running
+        original_proxy_running = wechat_downloader.history_proxy_process_running
         try:
-            wechat_downloader.process_running = lambda pid: int(pid) == 1234
+            wechat_downloader.history_proxy_process_running = lambda pid, port: int(pid) == 1234 and int(port) == 8899
             result = wechat_downloader.stop_history_proxy(self.tmp, old_session["session_id"])
         finally:
-            wechat_downloader.process_running = original_process_running
+            wechat_downloader.history_proxy_process_running = original_proxy_running
 
         self.assertTrue(result["ok"])
         self.assertFalse(result["stopped"])
@@ -1409,7 +1773,7 @@ class WizardContractTests(unittest.TestCase):
         original_platform = wechat_downloader.sys.platform
         original_choose = wechat_downloader.choose_network_service
         original_get = wechat_downloader.get_network_proxy_state
-        original_process_running = wechat_downloader.process_running
+        original_proxy_running = wechat_downloader.history_proxy_process_running
         try:
             wechat_downloader.sys.platform = "darwin"
             wechat_downloader.choose_network_service = lambda service="": "Wi-Fi"
@@ -1418,13 +1782,13 @@ class WizardContractTests(unittest.TestCase):
                 "web": {"enabled_bool": True, "server": "127.0.0.1", "port": "8899"},
                 "secure_web": {"enabled_bool": True, "server": "127.0.0.1", "port": "8899"},
             }
-            wechat_downloader.process_running = lambda pid: int(pid) == 1234
+            wechat_downloader.history_proxy_process_running = lambda pid, port: int(pid) == 1234 and int(port) == 8899
             result = wechat_downloader.stop_history_proxy(self.tmp, "active-session")
         finally:
             wechat_downloader.sys.platform = original_platform
             wechat_downloader.choose_network_service = original_choose
             wechat_downloader.get_network_proxy_state = original_get
-            wechat_downloader.process_running = original_process_running
+            wechat_downloader.history_proxy_process_running = original_proxy_running
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["requires_proxy_restore"])
@@ -1478,6 +1842,78 @@ class WizardContractTests(unittest.TestCase):
 
         self.assertEqual(context["session_id"], "session-b")
         self.assertEqual(context["session"]["account_name"], "B")
+
+    def test_snapshot_button_script_uses_safe_dom_state_rendering(self) -> None:
+        session = wechat_downloader.enhancer_session(self.tmp, 23555)
+        wechat_downloader.save_history_session(self.tmp, session)
+        original_runtime = os.environ.get("MOORE_WECHAT_RUNTIME_DIR")
+        original_session = os.environ.get("MOORE_WECHAT_SESSION_ID")
+        try:
+            os.environ["MOORE_WECHAT_RUNTIME_DIR"] = str(self.tmp)
+            os.environ["MOORE_WECHAT_SESSION_ID"] = session["session_id"]
+            addon = importlib.import_module("wechat_history_mitm_addon")
+            addon = importlib.reload(addon)
+        finally:
+            if original_runtime is None:
+                os.environ.pop("MOORE_WECHAT_RUNTIME_DIR", None)
+            else:
+                os.environ["MOORE_WECHAT_RUNTIME_DIR"] = original_runtime
+            if original_session is None:
+                os.environ.pop("MOORE_WECHAT_SESSION_ID", None)
+            else:
+                os.environ["MOORE_WECHAT_SESSION_ID"] = original_session
+        script = addon.SNAPSHOT_SCRIPT
+        self.assertIn("收藏到本地", script)
+        self.assertIn("createElement('span')", script)
+        self.assertIn("if (!r.ok) throw", script)
+        self.assertNotIn("btn.innerHTML", script)
+        injected = addon.inject_snapshot_button("<html><body><main>文章</main></body></html>")
+        self.assertIn("window.__mooreSnapshotInstalled", injected)
+        self.assertIn("收藏到本地", injected)
+        response = type("Response", (), {"headers": {"etag": "old", "last-modified": "yesterday"}})()
+        addon.prevent_article_response_cache(response)
+        self.assertEqual(response.headers["cache-control"], "no-store, no-cache, must-revalidate, max-age=0")
+        self.assertNotIn("etag", response.headers)
+        self.assertNotIn("last-modified", response.headers)
+
+    def test_video_channel_links_are_public_page_urls_and_credentials_are_removed(self) -> None:
+        session = wechat_downloader.enhancer_session(self.tmp, 23555)
+        wechat_downloader.save_history_session(self.tmp, session)
+        original_runtime = os.environ.get("MOORE_WECHAT_RUNTIME_DIR")
+        original_session = os.environ.get("MOORE_WECHAT_SESSION_ID")
+        try:
+            os.environ["MOORE_WECHAT_RUNTIME_DIR"] = str(self.tmp)
+            os.environ["MOORE_WECHAT_SESSION_ID"] = session["session_id"]
+            addon = importlib.import_module("wechat_history_mitm_addon")
+            addon = importlib.reload(addon)
+        finally:
+            if original_runtime is None:
+                os.environ.pop("MOORE_WECHAT_RUNTIME_DIR", None)
+            else:
+                os.environ["MOORE_WECHAT_RUNTIME_DIR"] = original_runtime
+            if original_session is None:
+                os.environ.pop("MOORE_WECHAT_SESSION_ID", None)
+            else:
+                os.environ["MOORE_WECHAT_SESSION_ID"] = original_session
+        links = addon.extract_channels_urls(
+            r'''{"url":"https:\/\/channels.weixin.qq.com\/web\/pages\/feed?finderUsername=demo&exportkey=secret&token=hidden"}'''
+            " https://finder.video.qq.com/media.mp4?key=secret"
+        )
+        self.assertEqual(
+            links,
+            ["https://channels.weixin.qq.com/web/pages/feed?finderUsername=demo"],
+        )
+        self.assertEqual(addon.sanitize_channels_url("https://channels.weixin.qq.com/static/app.js"), "")
+
+        log = wechat_downloader.auto_snapshot_root(self.tmp) / "video-links.jsonl"
+        addon.append_video_links(log, links, "mp.weixin.qq.com", "/s", "response-body")
+        addon.append_video_links(log, links, "mp.weixin.qq.com", "/s", "response-body")
+        payload = wechat_downloader.proxy_enhancer_video_links(self.tmp)
+        self.assertEqual(payload["link_count"], 1)
+        self.assertEqual(payload["links"][0]["url"], links[0])
+        serialized = log.read_text(encoding="utf-8")
+        self.assertNotIn("secret", serialized)
+        self.assertNotIn("hidden", serialized)
 
     def test_history_mitm_addon_extracts_embedded_msg_list_html(self) -> None:
         original_runtime = os.environ.get("MOORE_WECHAT_RUNTIME_DIR")
@@ -1665,7 +2101,7 @@ class WizardContractTests(unittest.TestCase):
                 "stopped": True,
                 "pid": 1234,
             }
-            result = wechat_downloader.finish_history_capture(self.tmp, "session-a", 50, True)
+            result = wechat_downloader.finish_history_capture(self.tmp, "session-a", 50, True, stop_proxy=True)
         finally:
             wechat_downloader.disable_system_proxy = original_disable
             wechat_downloader.stop_history_proxy = original_stop

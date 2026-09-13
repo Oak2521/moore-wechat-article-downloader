@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import html
 import http.cookiejar
 import json
@@ -39,20 +40,28 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from wechat_downloader import (  # noqa: E402
     DEFAULT_DELIVERY_DIR,
+    PAGE_DATA_END,
+    PAGE_DATA_START,
+    active_proxy_port,
     clean_url,
-    delivery_dir,
+    copy_to_clipboard,
+    extract_wechat_article_context,
     make_run_id,
+    markdown_cell,
     run_markdown_only_download,
     runtime_dir,
     safe_display_url,
     safe_name,
     sanitize_text_urls,
     scrub_payload,
+    start_proxy_enhancer_session,
     utc_now,
 )
+from wechat_credential_broker import broker_request, credential_capability_path, credential_socket_path  # noqa: E402
 
 
 DEFAULT_BASE_URL = "https://down.mptext.top"
+EXPORTER_DB_VERSION = 5
 ARTICLE_URL_RE = re.compile(r"https?://mp\.weixin\.qq\.com/[^\s\"'<>]+", re.I)
 DEFAULT_VISIBLE_FIELDS = [
     "title",
@@ -74,12 +83,6 @@ ALL_FIELDS = [
     "is_deleted",
     "article_status",
     "content_downloaded",
-    "comment_downloaded",
-    "read_count",
-    "like_count",
-    "share_count",
-    "favorite_count",
-    "comment_count",
     "author",
     "is_original",
     "collection_title",
@@ -100,18 +103,11 @@ ARTICLE_FIELDS = [
     "is_deleted",
     "article_status",
     "content_downloaded",
-    "comment_downloaded",
-    "read_count",
-    "like_count",
-    "share_count",
-    "favorite_count",
-    "comment_count",
     "collection_title",
     "raw_json",
     "created_at",
     "updated_at",
 ]
-
 
 def login_dir(base: Path) -> Path:
     return base / "exporter-login"
@@ -138,6 +134,63 @@ def login_qrcode_path_with_extension(base: Path, login_id: str, content_type: st
     else:
         suffix = ".jpg"
     return login_dir(base) / f"{safe_name(login_id, 80)}{suffix}"
+
+
+def open_local_file(path: Path) -> dict[str, Any]:
+    target = path.expanduser().resolve()
+    if not target.exists():
+        return {"opened": False, "open_method": "", "open_error": "file does not exist"}
+
+    def run(command: list[str], method: str) -> dict[str, Any]:
+        try:
+            completed = subprocess.run(
+                command,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {"opened": False, "open_method": method, "open_error": str(exc)}
+        error = (completed.stderr or "").strip()
+        return {"opened": completed.returncode == 0, "open_method": method, "open_error": error[:300]}
+
+    if sys.platform == "darwin":
+        return run(["open", str(target)], "macos-open")
+    if os.name == "nt":
+        try:
+            os.startfile(str(target))  # type: ignore[attr-defined]
+            return {"opened": True, "open_method": "windows-startfile", "open_error": ""}
+        except OSError as exc:
+            return {"opened": False, "open_method": "windows-startfile", "open_error": str(exc)}
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        try:
+            converted = subprocess.run(
+                ["wslpath", "-w", str(target)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            converted = None
+        windows_path = converted.stdout.strip() if converted and converted.returncode == 0 else ""
+        if windows_path:
+            return run(["explorer.exe", windows_path], "wsl-explorer")
+    for executable, arguments, method in [
+        ("xdg-open", [str(target)], "linux-xdg-open"),
+        ("gio", ["open", str(target)], "linux-gio-open"),
+    ]:
+        command = shutil.which(executable)
+        if command:
+            return run([command, *arguments], method)
+    opened = webbrowser.open(target.as_uri())
+    return {
+        "opened": bool(opened),
+        "open_method": "python-webbrowser",
+        "open_error": "" if opened else "no system file opener is available",
+    }
 
 
 def app_db_path(base: Path) -> Path:
@@ -188,6 +241,138 @@ def load_json_text(value: str) -> Any:
         return json.loads(value)
     except json.JSONDecodeError:
         return None
+
+
+def ensure_exporter_column(db: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    columns = {str(row[1]) for row in db.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def migrate_exporter_db(db: sqlite3.Connection) -> None:
+    """Apply additive, idempotent migrations for local-only article metadata."""
+    ensure_exporter_column(db, "article_comments", "comment_scope", "TEXT NOT NULL DEFAULT 'elected'")
+    ensure_exporter_column(db, "article_comments", "source", "TEXT NOT NULL DEFAULT 'import'")
+    ensure_exporter_column(db, "article_comments", "fetched_at", "TEXT NOT NULL DEFAULT ''")
+    ensure_exporter_column(db, "article_comments", "complete", "INTEGER NOT NULL DEFAULT 0")
+    db.execute("UPDATE article_comments SET comment_scope = 'elected' WHERE TRIM(comment_scope) = ''")
+    db.execute("UPDATE article_comments SET source = 'import' WHERE TRIM(source) = ''")
+    db.execute("UPDATE article_comments SET fetched_at = created_at WHERE TRIM(fetched_at) = ''")
+    db.execute("UPDATE article_comments SET comment_id = 'legacy-' || id WHERE TRIM(comment_id) = ''")
+    db.execute(
+        """
+        DELETE FROM article_comments
+        WHERE id NOT IN (
+            SELECT MIN(id)
+            FROM article_comments
+            GROUP BY article_id, comment_id, comment_scope
+        )
+        """
+    )
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_article_comments_identity "
+        "ON article_comments(article_id, comment_id, comment_scope)"
+    )
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS account_biz_mappings (
+            account_id INTEGER PRIMARY KEY,
+            biz TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'verified',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(account_id) REFERENCES target_accounts(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS article_contexts (
+            article_id INTEGER PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            biz TEXT NOT NULL DEFAULT '',
+            msgid TEXT NOT NULL DEFAULT '',
+            idx INTEGER NOT NULL DEFAULT 0,
+            comment_id TEXT NOT NULL DEFAULT '',
+            url TEXT NOT NULL DEFAULT '',
+            context_status TEXT NOT NULL DEFAULT 'missing',
+            source TEXT NOT NULL DEFAULT '',
+            resolved_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(article_id) REFERENCES articles(id),
+            FOREIGN KEY(account_id) REFERENCES target_accounts(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_article_contexts_account_status
+            ON article_contexts(account_id, context_status);
+
+        CREATE TABLE IF NOT EXISTS engagement_runs (
+            run_id TEXT PRIMARY KEY,
+            account_id INTEGER NOT NULL,
+            scope_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL,
+            requested_count INTEGER NOT NULL DEFAULT 0,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            failed_count INTEGER NOT NULL DEFAULT 0,
+            credential_expires_at TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(account_id) REFERENCES target_accounts(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS article_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT NOT NULL DEFAULT '',
+            article_id INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            captured_at TEXT NOT NULL,
+            read_count INTEGER,
+            like_count INTEGER,
+            old_like_count INTEGER,
+            share_count INTEGER,
+            comment_count INTEGER,
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            FOREIGN KEY(article_id) REFERENCES articles(id),
+            UNIQUE(run_id, article_id, source)
+        );
+
+        CREATE TABLE IF NOT EXISTS article_comment_replies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article_comment_id INTEGER NOT NULL,
+            reply_id TEXT NOT NULL,
+            nick_name TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL DEFAULT '',
+            like_count INTEGER,
+            create_time TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            fetched_at TEXT NOT NULL DEFAULT '',
+            complete INTEGER NOT NULL DEFAULT 0,
+            raw_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(article_comment_id) REFERENCES article_comments(id),
+            UNIQUE(article_comment_id, reply_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS article_write_locks (
+            article_id INTEGER PRIMARY KEY,
+            owner TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(article_id) REFERENCES articles(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS evolution_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            stage TEXT NOT NULL,
+            code TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'info',
+            account_id INTEGER NOT NULL DEFAULT 0,
+            article_id INTEGER NOT NULL DEFAULT 0,
+            run_id TEXT NOT NULL DEFAULT '',
+            detail_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL
+        );
+        """
+    )
 
 
 def init_exporter_db(base: Path) -> dict[str, Any]:
@@ -359,7 +544,8 @@ def init_exporter_db(base: Path) -> dict[str, Any]:
             """,
             ("default", json_dumps(DEFAULT_VISIBLE_FIELDS), "markdown", now, now),
         )
-        db.execute("PRAGMA user_version = 3")
+        migrate_exporter_db(db)
+        db.execute(f"PRAGMA user_version = {EXPORTER_DB_VERSION}")
         db.commit()
     finally:
         db.close()
@@ -619,10 +805,131 @@ def extract_cookie_value(set_cookies: list[str], name: str) -> str:
     return ""
 
 
-def start_qr_login(base: Path, base_url: str) -> dict[str, Any]:
+QR_LOGIN_REUSABLE_STATUSES = {"waiting_for_scan", "scanned_waiting_confirm", "confirmed"}
+QR_LOGIN_PROMPT = "请扫码：请用微信扫码并在手机端确认。"
+
+
+def parse_iso_datetime(value: str) -> dt.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed
+
+
+def qr_login_qrcode_exists(session: dict[str, Any]) -> bool:
+    raw_path = str(session.get("qrcode_path") or "").strip()
+    return bool(raw_path) and Path(raw_path).expanduser().exists()
+
+
+def is_reusable_qr_login_session(session: dict[str, Any], base_url: str = "", now: dt.datetime | None = None) -> bool:
+    if not str(session.get("login_id") or ""):
+        return False
+    status = str(session.get("status") or "")
+    if status not in QR_LOGIN_REUSABLE_STATUSES:
+        return False
+    expires_at = parse_iso_datetime(str(session.get("expires_at") or ""))
+    if not expires_at:
+        return False
+    current = now or dt.datetime.now(dt.timezone.utc)
+    if expires_at <= current:
+        return False
+    if base_url and str(session.get("base_url") or "") != base_url:
+        return False
+    return qr_login_qrcode_exists(session)
+
+
+def find_reusable_qr_login_session(base: Path, base_url: str) -> dict[str, Any] | None:
+    directory = login_dir(base)
+    if not directory.exists():
+        return None
+    now = dt.datetime.now(dt.timezone.utc)
+    for path in sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        try:
+            session = read_json_file(path)
+        except Exception:
+            continue
+        if not isinstance(session, dict):
+            continue
+        status = str(session.get("status") or "")
+        expires_at = parse_iso_datetime(str(session.get("expires_at") or ""))
+        if status in QR_LOGIN_REUSABLE_STATUSES and expires_at and expires_at <= now:
+            session["status"] = "expired"
+            session["updated_at"] = utc_now()
+            write_json_file(path, session)
+            continue
+        if is_reusable_qr_login_session(session, base_url, now):
+            return session
+    return None
+
+
+def qr_login_next_step(status: str) -> str:
+    if status == "confirmed":
+        return "已扫码并确认，运行 exporter-login-qr-complete 完成登录。"
+    if status == "scanned_waiting_confirm":
+        return "已扫码，请在手机端确认；确认后运行 exporter-login-qr-status 和 exporter-login-qr-complete。"
+    return "请用微信扫码并在手机端确认；确认后运行 exporter-login-qr-status 和 exporter-login-qr-complete。"
+
+
+def open_qr_login_session_once(base: Path, session: dict[str, Any], open_qrcode: bool) -> dict[str, Any]:
+    if not open_qrcode:
+        return {}
+    if session.get("qrcode_open_attempted_at"):
+        return {
+            "opened": bool(session.get("qrcode_opened")),
+            "open_method": str(session.get("qrcode_open_method") or ""),
+            "open_error": str(session.get("qrcode_open_error") or ""),
+            "open_skipped": "already_attempted",
+        }
+    qrcode_path = Path(str(session.get("qrcode_path") or ""))
+    open_result = open_local_file(qrcode_path)
+    now = utc_now()
+    session["qrcode_open_attempted_at"] = now
+    session["qrcode_opened"] = bool(open_result.get("opened"))
+    session["qrcode_open_method"] = str(open_result.get("open_method") or "")
+    session["qrcode_open_error"] = str(open_result.get("open_error") or "")
+    if open_result.get("opened"):
+        session["qrcode_opened_at"] = now
+    session["updated_at"] = now
+    write_json_file(login_session_path(base, str(session.get("login_id") or "")), session)
+    open_result["open_skipped"] = ""
+    return open_result
+
+
+def qr_login_start_result(
+    base: Path,
+    session: dict[str, Any],
+    *,
+    open_qrcode: bool,
+    reused: bool,
+) -> dict[str, Any]:
+    status = str(session.get("status") or "waiting_for_scan")
+    result = {
+        "ok": True,
+        "login_id": str(session.get("login_id") or ""),
+        "base_url": str(session.get("base_url") or ""),
+        "qrcode_path": str(session.get("qrcode_path") or ""),
+        "expires_at": str(session.get("expires_at") or ""),
+        "status": status,
+        "reused_existing_session": reused,
+        "message": QR_LOGIN_PROMPT,
+        "next_step": qr_login_next_step(status),
+    }
+    result.update(open_qr_login_session_once(base, session, open_qrcode))
+    return result
+
+
+def start_qr_login(base: Path, base_url: str, open_qrcode: bool = False) -> dict[str, Any]:
     init_exporter_db(base)
     base_url = normalize_base_url(base_url or get_config(base, "base_url", DEFAULT_BASE_URL))
     set_config(base, "base_url", base_url)
+    reusable = find_reusable_qr_login_session(base, base_url)
+    if reusable:
+        return qr_login_start_result(base, reusable, open_qrcode=open_qrcode, reused=True)
     login_id = uuid.uuid4().hex
     sid = str(int(time.time() * 1000)) + str(int(time.time_ns() % 100))
     jar = login_cookie_jar(base, login_id)
@@ -657,14 +964,7 @@ def start_qr_login(base: Path, base_url: str) -> dict[str, Any]:
         "expires_at": expires_at,
     }
     write_json_file(login_session_path(base, login_id), session)
-    return {
-        "ok": True,
-        "login_id": login_id,
-        "base_url": base_url,
-        "qrcode_path": str(qrcode_path),
-        "expires_at": expires_at,
-        "next_step": "Scan the QR code with WeChat, confirm login, then run exporter-login-qr-status and exporter-login-qr-complete.",
-    }
+    return qr_login_start_result(base, session, open_qrcode=open_qrcode, reused=False)
 
 
 def load_qr_login_session(base: Path, login_id: str) -> dict[str, Any]:
@@ -711,7 +1011,7 @@ def qr_login_status(base: Path, login_id: str) -> dict[str, Any]:
     }
 
 
-def complete_qr_login(base: Path, login_id: str, profile: str = "") -> dict[str, Any]:
+def complete_qr_login(base: Path, login_id: str, profile: str = "", allow_plain: bool = False) -> dict[str, Any]:
     session = load_qr_login_session(base, login_id)
     jar = login_cookie_jar(base, login_id)
     _raw, payload, set_cookies, _ctype = request_with_cookie_jar(
@@ -728,7 +1028,7 @@ def complete_qr_login(base: Path, login_id: str, profile: str = "") -> dict[str,
         raise RuntimeError("auth-key was not returned by exporter bizlogin")
     nickname = str(payload.get("nickname") or payload.get("nick_name") or profile or "default")
     expires_at = str(payload.get("expires") or (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=4)).isoformat())
-    result = upsert_login_profile(base, str(session["base_url"]), auth_key, profile or nickname or "default", expires_at, False)
+    result = upsert_login_profile(base, str(session["base_url"]), auth_key, profile or nickname or "default", expires_at, allow_plain)
     db = connect_db(base)
     try:
         db.execute(
@@ -857,12 +1157,6 @@ def normalize_article(item: dict[str, Any], account_id: int) -> dict[str, Any]:
         "is_deleted": 1 if str(item.get("is_deleted") or item.get("deleted") or "").lower() in {"1", "true"} else 0,
         "article_status": str(item.get("article_status") or item.get("status") or "").strip(),
         "content_downloaded": 0,
-        "comment_downloaded": 0,
-        "read_count": maybe_int(item.get("read_count") or item.get("readNum")),
-        "like_count": maybe_int(item.get("like_count") or item.get("likeNum")),
-        "share_count": maybe_int(item.get("share_count") or item.get("shareNum")),
-        "favorite_count": maybe_int(item.get("favorite_count") or item.get("favoriteNum")),
-        "comment_count": maybe_int(item.get("comment_count") or item.get("commentNum")),
         "collection_title": str(item.get("collection_title") or item.get("album_title") or item.get("tag_name") or "").strip(),
         "raw_json": json_dumps(item),
     }
@@ -875,6 +1169,154 @@ def maybe_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def extract_comment_id_from_html(value: str) -> str:
+    return extract_wechat_article_context(value, "").get("comment_id", "")
+
+
+def biz_from_article_url(value: str) -> str:
+    try:
+        values = urllib.parse.parse_qs(urllib.parse.urlsplit(value).query, keep_blank_values=True)
+    except ValueError:
+        return ""
+    return html.unescape(str((values.get("__biz") or [""])[0])).strip()
+
+
+def resolve_article_context(
+    base: Path,
+    article_id: int,
+    html_text: str = "",
+    biz: str = "",
+    source: str = "html",
+    comment_id: str = "",
+) -> dict[str, Any]:
+    """Store only non-sensitive article identifiers needed by a future worker."""
+    init_exporter_db(base)
+    db = connect_db(base)
+    try:
+        row = db.execute(
+            "SELECT id, account_id, msgid, idx, url FROM articles WHERE id = ?", (article_id,)
+        ).fetchone()
+        if not row:
+            return {"ok": False, "error": "article not found", "article_id": article_id}
+        account_id = int(row["account_id"])
+        account_mapping = db.execute("SELECT biz FROM account_biz_mappings WHERE account_id = ?", (account_id,)).fetchone()
+        explicit_biz = str(biz or biz_from_article_url(str(row["url"] or ""))).strip()
+        resolved_biz = explicit_biz or (str(account_mapping["biz"] or "").strip() if account_mapping else "")
+        mapped = db.execute("SELECT account_id FROM account_biz_mappings WHERE biz = ?", (resolved_biz,)).fetchone() if resolved_biz else None
+        if mapped and int(mapped["account_id"]) != account_id:
+            return {
+                "ok": False,
+                "article_id": article_id,
+                "context_status": "mapping_conflict",
+                "error": "__biz is already mapped to another local account",
+            }
+        if account_mapping and resolved_biz and str(account_mapping["biz"]) != resolved_biz:
+            return {
+                "ok": False,
+                "article_id": article_id,
+                "context_status": "mapping_conflict",
+                "error": "local account is already mapped to another __biz",
+            }
+        now = utc_now()
+        if resolved_biz and not mapped and not account_mapping:
+            db.execute(
+                """
+                INSERT INTO account_biz_mappings (account_id, biz, source, status, created_at, updated_at)
+                VALUES (?, ?, ?, 'verified', ?, ?)
+                """,
+                (account_id, resolved_biz, source, now, now),
+            )
+        resolved_comment_id = str(comment_id or extract_comment_id_from_html(html_text)).strip()
+        msgid = str(row["msgid"] or "")
+        status = "ready" if resolved_biz and msgid and resolved_comment_id else "incomplete"
+        db.execute(
+            """
+            INSERT INTO article_contexts
+                (article_id, account_id, biz, msgid, idx, comment_id, url, context_status, source, resolved_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(article_id) DO UPDATE SET
+                account_id = excluded.account_id,
+                biz = CASE WHEN excluded.biz <> '' THEN excluded.biz ELSE article_contexts.biz END,
+                msgid = excluded.msgid,
+                idx = excluded.idx,
+                comment_id = CASE WHEN excluded.comment_id <> '' THEN excluded.comment_id ELSE article_contexts.comment_id END,
+                url = excluded.url,
+                context_status = excluded.context_status,
+                source = excluded.source,
+                resolved_at = excluded.resolved_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                article_id,
+                account_id,
+                resolved_biz,
+                msgid,
+                int(row["idx"] or 0),
+                resolved_comment_id,
+                str(row["url"] or ""),
+                status,
+                source,
+                now,
+                now,
+            ),
+        )
+        db.commit()
+        context = db.execute("SELECT * FROM article_contexts WHERE article_id = ?", (article_id,)).fetchone()
+        return {"ok": status == "ready", "article_id": article_id, "context_status": status, "context": dict(context)}
+    finally:
+        db.close()
+
+
+def comment_identity(row: dict[str, Any]) -> str:
+    value = str(row.get("comment_id") or row.get("id") or "").strip()
+    if value:
+        return value
+    fingerprint = "\n".join(
+        [
+            str(row.get("nick_name") or row.get("nickname") or row.get("user") or ""),
+            str(row.get("content") or row.get("comment") or ""),
+            str(row.get("create_time") or row.get("time") or ""),
+        ]
+    )
+    return "derived-" + hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:24]
+
+
+def upsert_comment_row(db: sqlite3.Connection, article_id: int, row: dict[str, Any], source: str = "import") -> None:
+    now = utc_now()
+    scope = str(row.get("comment_scope") or row.get("scope") or "elected").strip() or "elected"
+    db.execute(
+        """
+        INSERT INTO article_comments
+            (article_id, comment_id, nick_name, content, like_count, create_time, raw_json, created_at,
+             comment_scope, source, fetched_at, complete)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(article_id, comment_id, comment_scope) DO UPDATE SET
+            nick_name = excluded.nick_name,
+            content = excluded.content,
+            like_count = excluded.like_count,
+            create_time = excluded.create_time,
+            raw_json = excluded.raw_json,
+            source = excluded.source,
+            fetched_at = excluded.fetched_at,
+            complete = excluded.complete
+        """,
+        (
+            article_id,
+            comment_identity(row),
+            str(row.get("nick_name") or row.get("nickname") or row.get("user") or ""),
+            str(row.get("content") or row.get("comment") or ""),
+            maybe_int(row.get("like_count") or row.get("like")),
+            parse_time(row.get("create_time") or row.get("time")),
+            json_dumps(scrub_payload(row)),
+            now,
+            scope,
+            str(row.get("source") or source),
+            str(row.get("fetched_at") or now),
+            1 if bool(row.get("complete")) else 0,
+        ),
+    )
 
 
 def search_accounts(base: Path, keyword: str, begin: int = 0, size: int = 10, profile: str = "") -> dict[str, Any]:
@@ -1103,11 +1545,6 @@ def upsert_articles(base: Path, rows: list[dict[str, Any]]) -> int:
                     is_original = excluded.is_original,
                     is_deleted = excluded.is_deleted,
                     article_status = excluded.article_status,
-                    read_count = COALESCE(excluded.read_count, articles.read_count),
-                    like_count = COALESCE(excluded.like_count, articles.like_count),
-                    share_count = COALESCE(excluded.share_count, articles.share_count),
-                    favorite_count = COALESCE(excluded.favorite_count, articles.favorite_count),
-                    comment_count = COALESCE(excluded.comment_count, articles.comment_count),
                     collection_title = excluded.collection_title,
                     raw_json = excluded.raw_json,
                     updated_at = excluded.updated_at
@@ -1265,19 +1702,40 @@ def open_original(base: Path, article_id: int) -> dict[str, Any]:
     return {"ok": True, "opened": opened, "url": article["url"], "title": article["title"]}
 
 
-def get_article_urls(base: Path, article_ids: list[int]) -> list[tuple[int, str]]:
+def get_article_download_rows(base: Path, article_ids: list[int]) -> list[dict[str, Any]]:
     if not article_ids:
         return []
     placeholders = ",".join(["?"] * len(article_ids))
     db = connect_db(base)
     try:
         rows = db.execute(
-            f"SELECT id, url FROM articles WHERE id IN ({placeholders}) ORDER BY publish_time DESC, id DESC",
+            f"""
+            SELECT
+                a.id,
+                a.account_id,
+                a.msgid,
+                a.idx,
+                a.title,
+                a.url,
+                a.publish_time,
+                a.content_downloaded,
+                a.raw_json,
+                t.nickname AS account_name
+            FROM articles a
+            JOIN target_accounts t ON t.id = a.account_id
+            WHERE a.id IN ({placeholders})
+            ORDER BY a.publish_time DESC, a.id DESC
+            """,
             article_ids,
         ).fetchall()
-        return [(int(row["id"]), str(row["url"])) for row in rows]
+        return [dict(row) for row in rows]
     finally:
         db.close()
+
+
+def get_article_urls(base: Path, article_ids: list[int]) -> list[tuple[int, str]]:
+    rows = get_article_download_rows(base, article_ids)
+    return [(int(row["id"]), str(row["url"])) for row in rows]
 
 
 def select_article_ids(
@@ -1305,31 +1763,533 @@ def _safe_dir_name(name: str) -> str:
     return safe or "account"
 
 
-def download_articles(
+def unique_article_file_stems(rows: list[dict[str, Any]]) -> dict[str, str]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        stem = _safe_dir_name(str(row.get("title") or "untitled"))
+        counts[stem] = counts.get(stem, 0) + 1
+    result: dict[str, str] = {}
+    for row in rows:
+        stem = _safe_dir_name(str(row.get("title") or "untitled"))
+        if counts.get(stem, 0) > 1:
+            suffix = str(row.get("msgid") or row.get("id") or "").strip()
+            stem = f"{stem}-{suffix}" if suffix else stem
+        result[str(row.get("url") or "")] = stem
+    return result
+
+
+def write_account_index(output_dir: Path, rows: list[dict[str, Any]], manifest: dict[str, Any], run_id: str) -> None:
+    index_path = output_dir / "index.csv"
+    fields = [
+        "seq",
+        "db_article_id",
+        "msgid",
+        "title",
+        "account",
+        "publish_time",
+        "source_url",
+        "markdown_path",
+        "image_dir",
+        "image_count",
+        "content_type",
+        "item_show_type",
+        "status",
+        "error",
+        "downloaded_at",
+        "run_id",
+        "content_article_id",
+    ]
+    existing: dict[str, dict[str, Any]] = {}
+    if index_path.exists():
+        with index_path.open("r", encoding="utf-8-sig", newline="") as fh:
+            for item in csv.DictReader(fh):
+                key = str(item.get("db_article_id") or item.get("source_url") or "")
+                if key:
+                    existing[key] = dict(item)
+    row_by_url = {str(row.get("url") or ""): row for row in rows}
+    downloaded_at = utc_now()
+    for item in manifest.get("articles", []):
+        source_url = str(item.get("source_url") or "")
+        row = row_by_url.get(source_url)
+        if not row:
+            continue
+        key = str(row.get("id"))
+        existing.pop(source_url, None)
+        existing[key] = {
+            "seq": item.get("seq", ""),
+            "db_article_id": row.get("id", ""),
+            "msgid": row.get("msgid", ""),
+            "title": item.get("title", row.get("title", "")),
+            "account": row.get("account_name", item.get("account", "")),
+            "publish_time": row.get("publish_time", ""),
+            "source_url": source_url,
+            "markdown_path": item.get("markdown_path", ""),
+            "image_dir": item.get("image_dir", ""),
+            "image_count": item.get("image_count", ""),
+            "content_type": item.get("content_type", ""),
+            "item_show_type": item.get("item_show_type", ""),
+            "status": item.get("status", "success"),
+            "error": item.get("error", ""),
+            "downloaded_at": downloaded_at,
+            "run_id": run_id,
+            "content_article_id": item.get("article_id", ""),
+        }
+    for item in manifest.get("failed", []):
+        source_url = str(item.get("source_url") or "")
+        row = row_by_url.get(source_url)
+        key = str(row.get("id")) if row else source_url
+        if not key:
+            continue
+        if row:
+            existing.pop(source_url, None)
+        existing[key] = {
+            **{field: "" for field in fields},
+            "seq": item.get("seq", ""),
+            "db_article_id": row.get("id", "") if row else "",
+            "msgid": row.get("msgid", "") if row else "",
+            "title": row.get("title", item.get("title", "")) if row else item.get("title", ""),
+            "account": row.get("account_name", item.get("account", "")) if row else item.get("account", ""),
+            "publish_time": row.get("publish_time", "") if row else "",
+            "source_url": source_url,
+            "status": "failed",
+            "error": item.get("error", ""),
+            "downloaded_at": downloaded_at,
+            "run_id": run_id,
+        }
+    ordered = sorted(existing.values(), key=lambda item: (str(item.get("publish_time") or ""), str(item.get("db_article_id") or "")), reverse=True)
+    with index_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fields)
+        writer.writeheader()
+        for item in ordered:
+            writer.writerow({field: item.get(field, "") for field in fields})
+
+
+def read_account_index(output_dir: Path) -> dict[str, dict[str, str]]:
+    index_path = output_dir / "index.csv"
+    if not index_path.exists():
+        return {}
+    rows: dict[str, dict[str, str]] = {}
+    with index_path.open("r", encoding="utf-8-sig", newline="") as fh:
+        for item in csv.DictReader(fh):
+            key = str(item.get("db_article_id") or item.get("source_url") or "")
+            if key:
+                rows[key] = dict(item)
+            source_url = str(item.get("source_url") or "")
+            if source_url:
+                rows[source_url] = dict(item)
+    return rows
+
+
+def account_index_file_exists(output_dir: Path, row: dict[str, Any]) -> tuple[bool, dict[str, str]]:
+    indexed = read_account_index(output_dir)
+    item = indexed.get(str(row.get("id") or "")) or indexed.get(str(row.get("url") or ""))
+    if not item or item.get("status") != "success":
+        return False, item or {}
+    markdown = str(item.get("markdown_path") or "")
+    if not markdown:
+        return False, item
+    markdown_path = Path(markdown)
+    if not markdown_path.is_absolute():
+        markdown_path = output_dir / markdown_path
+    if not markdown_path.exists():
+        return False, item
+    try:
+        image_count = int(item.get("image_count") or 0)
+    except (TypeError, ValueError):
+        image_count = 0
+    image_dir = str(item.get("image_dir") or "")
+    if image_count > 0:
+        image_path = Path(image_dir)
+        if not image_path.is_absolute():
+            image_path = output_dir / image_path
+        if not image_path.exists():
+            return False, item
+        try:
+            image_files = [path for path in image_path.iterdir() if path.is_file()]
+        except OSError:
+            return False, item
+        if len(image_files) < image_count:
+            return False, item
+    return True, item
+
+
+def account_output_dir(root: str, account_name: str) -> Path:
+    safe_account = _safe_dir_name(account_name)
+    if root:
+        root_path = Path(root).expanduser().resolve()
+        if root_path.name == safe_account:
+            return root_path
+        return (root_path / safe_account).resolve()
+    return (DEFAULT_DELIVERY_DIR / safe_account).expanduser().resolve()
+
+
+def article_raw_payload(row: dict[str, Any]) -> dict[str, Any]:
+    raw = row.get("raw_json")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        payload = json.loads(str(raw or "{}"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def article_may_have_video(row: dict[str, Any]) -> bool:
+    payload = article_raw_payload(row)
+    show_type = str(payload.get("item_show_type") or payload.get("show_type") or payload.get("itemShowType") or "").strip()
+    if show_type == "5":
+        return True
+    for key in ("media_duration", "video_duration", "duration", "video_url", "video_vid", "vid"):
+        if payload.get(key):
+            return True
+    title = str(row.get("title") or "")
+    return bool(re.search(r"\bvideo\b|视频号|视频", title, re.I))
+
+
+def video_proxy_request(base: Path, path: str, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    port = active_proxy_port(base)
+    if not port:
+        return {"ok": False, "status": "needs_capture", "error": "no active proxy-enhancer session"}
+    proxy = f"http://127.0.0.1:{port}"
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    data = None
+    headers = {"User-Agent": "Moore-WeChat-Exporter/1.0"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(f"http://channels.weixin.qq.com{path}", data=data, headers=headers, method=method)
+    try:
+        with opener.open(req, timeout=10) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        return {"ok": False, "status": "needs_capture", "error": str(exc)}
+    try:
+        result = json.loads(text)
+    except Exception:
+        return {"ok": False, "status": "failed", "error": "video proxy returned non-json response"}
+    return result if isinstance(result, dict) else {"ok": False, "status": "failed", "error": "video proxy returned invalid response"}
+
+
+def normalize_match_text(value: str) -> str:
+    return re.sub(r"\s+", "", re.sub(r"^\[(?:图文|贴图|视频)\]\s*", "", str(value or ""))).lower()
+
+
+def select_video_descriptor(row: dict[str, Any], videos: list[dict[str, Any]], candidate_count: int) -> dict[str, Any] | None:
+    if not videos:
+        return None
+    title = normalize_match_text(str(row.get("title") or ""))
+    if title:
+        for item in videos:
+            haystacks = [
+                normalize_match_text(str(item.get("source_title") or "")),
+                normalize_match_text(str(item.get("description") or "")),
+            ]
+            if any(title and (title in haystack or haystack in title) for haystack in haystacks if haystack):
+                return item
+    if len(videos) == 1 and candidate_count == 1:
+        return videos[0]
+    return None
+
+
+def download_exporter_videos(base: Path, rows: list[dict[str, Any]], out_dir: Path, quality: str = "highest") -> dict[str, Any]:
+    candidates = [row for row in rows if article_may_have_video(row)]
+    if not candidates:
+        return {"ok": True, "status": "no_video_candidates", "candidate_count": 0, "success_count": 0, "needs_capture_count": 0, "failed": []}
+    status = video_proxy_request(base, "/__moore_video_status")
+    if not status.get("ok"):
+        return {
+            "ok": False,
+            "status": "needs_capture",
+            "candidate_count": len(candidates),
+            "success_count": 0,
+            "needs_capture_count": len(candidates),
+            "failed": [],
+            "next_step": "Start proxy-enhancer-session-start, open the target WeChat Channels/video page, wait for capture, then rerun exporter-download --include-video.",
+            "error": status.get("error", ""),
+        }
+    videos = status.get("videos") if isinstance(status.get("videos"), list) else []
+    results: list[dict[str, Any]] = []
+    needs_capture: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
+    for row in candidates:
+        descriptor = select_video_descriptor(row, videos, len(candidates))
+        if not descriptor:
+            needs_capture.append(
+                {
+                    "article_id": int(row.get("id") or 0),
+                    "title": row.get("title", ""),
+                    "status": "needs_capture",
+                    "reason": "no matching captured video descriptor",
+                }
+            )
+            continue
+        filename = f"[视频]{_safe_dir_name(str(row.get('title') or descriptor.get('description') or 'wechat-video'))}.mp4"
+        payload = {
+            "id": descriptor.get("id"),
+            "quality": quality,
+            "filename": filename,
+            "output_dir": str(out_dir / "videos"),
+        }
+        downloaded = video_proxy_request(base, "/__moore_video_download", "POST", payload)
+        item = {
+            "article_id": int(row.get("id") or 0),
+            "title": row.get("title", ""),
+            "descriptor_id": descriptor.get("id", ""),
+            "status": downloaded.get("status") or ("success" if downloaded.get("ok") else "failed"),
+            "path": downloaded.get("path", ""),
+            "bytes": downloaded.get("bytes", ""),
+            "error": downloaded.get("error", ""),
+        }
+        if downloaded.get("ok"):
+            results.append(item)
+        elif downloaded.get("status") == "needs_capture":
+            needs_capture.append(item)
+        else:
+            failed.append(item)
+    return {
+        "ok": not needs_capture and not failed,
+        "status": "complete" if not needs_capture and not failed else "needs_capture" if needs_capture else "failed",
+        "candidate_count": len(candidates),
+        "success_count": len(results),
+        "needs_capture_count": len(needs_capture),
+        "failure_count": len(failed),
+        "results": results,
+        "needs_capture": needs_capture,
+        "failed": failed,
+        "video_dir": str(out_dir / "videos"),
+        "next_step": (
+            "Open the video page with proxy-enhancer running, then rerun exporter-download --include-video."
+            if needs_capture
+            else ""
+        ),
+    }
+
+
+def log_evolution_event(
     base: Path,
-    article_ids: list[int],
-    output_dir: str = "",
-    no_assets: bool = False,
-    account_nickname: str = "",
+    stage: str,
+    code: str,
+    severity: str = "info",
+    account_id: int = 0,
+    article_id: int = 0,
+    run_id: str = "",
+    detail: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    pairs = get_article_urls(base, article_ids)
-    if not pairs:
+    init_exporter_db(base)
+    event_id = "evo-" + make_run_id()
+    safe_detail = scrub_payload(detail or {})
+    db = connect_db(base)
+    try:
+        db.execute(
+            """
+            INSERT INTO evolution_events
+                (event_id, stage, code, severity, account_id, article_id, run_id, detail_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                stage,
+                code,
+                severity,
+                int(account_id or 0),
+                int(article_id or 0),
+                run_id,
+                json_dumps(safe_detail),
+                utc_now(),
+            ),
+        )
+        db.commit()
+    finally:
+        db.close()
+    return {"event_id": event_id, "stage": stage, "code": code}
+
+
+def list_evolution_events(base: Path, limit: int = 50) -> list[dict[str, Any]]:
+    init_exporter_db(base)
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            """
+            SELECT event_id, stage, code, severity, account_id, article_id, run_id, detail_json, created_at
+            FROM evolution_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit or 50), 500)),),
+        ).fetchall()
+    finally:
+        db.close()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["detail"] = load_json_text(str(item.pop("detail_json") or "{}")) or {}
+        result.append(item)
+    return result
+
+
+def export_evolution_fixture(base: Path, output_path: str, limit: int = 50) -> dict[str, Any]:
+    events = list_evolution_events(base, limit)
+    payload = scrub_payload(
+        {
+            "version": 1,
+            "created_at": utc_now(),
+            "source": "wechat-collection-diagnostics",
+            "event_count": len(events),
+            "events": events,
+            "reference_project_checklist": [
+                "确认竞品是否仅获取精选评论，不宣称全量评论。",
+                "确认互动接口参数来源：__biz、msgid、idx、comment_id 与短时会话凭证。",
+                "确认失败事件是否能复现到本地 fixture，且不包含 cookie/token/key/pass_ticket/auth-key。",
+            ],
+        }
+    )
+    path = Path(output_path).expanduser()
+    if not path.is_absolute():
+        path = (base / path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {"ok": True, "fixture": str(path), "event_count": len(events)}
+
+
+def verify_account_library(base: Path, account_id: int, output_dir: Path) -> dict[str, Any]:
+    init_exporter_db(base)
+    indexed = read_account_index(output_dir)
+    issues: list[dict[str, Any]] = []
+    fixed = 0
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            """
+            SELECT id, title, url, content_downloaded
+            FROM articles
+            WHERE account_id = ?
+            """,
+            (account_id,),
+        ).fetchall()
+        for row in rows:
+            item = dict(row)
+            index_item = indexed.get(str(item["id"])) or indexed.get(str(item["url"] or ""))
+            markdown_rel = str((index_item or {}).get("markdown_path") or "")
+            markdown_exists = False
+            if markdown_rel:
+                markdown_path = Path(markdown_rel)
+                if not markdown_path.is_absolute():
+                    markdown_path = output_dir / markdown_path
+                markdown_exists = markdown_path.exists()
+            if int(item.get("content_downloaded") or 0) and not markdown_exists:
+                issues.append(
+                    {
+                        "article_id": int(item["id"]),
+                        "code": "downloaded_markdown_missing",
+                        "title": str(item.get("title") or ""),
+                    }
+                )
+                db.execute("UPDATE articles SET content_downloaded = 0, updated_at = ? WHERE id = ?", (utc_now(), int(item["id"])))
+                fixed += 1
+            if index_item and str(index_item.get("status") or "") == "success" and not markdown_exists:
+                issues.append(
+                    {
+                        "article_id": int(item["id"]),
+                        "code": "index_markdown_missing",
+                        "title": str(item.get("title") or ""),
+                    }
+                )
+        db.commit()
+    finally:
+        db.close()
+    if issues:
+        log_evolution_event(
+            base,
+            "library_verify",
+            "library_inconsistent",
+            "warning",
+            account_id=account_id,
+            detail={"issue_count": len(issues), "fixed_count": fixed, "issue_codes": sorted({item["code"] for item in issues})},
+        )
+    return {"ok": not issues, "issue_count": len(issues), "fixed_count": fixed, "issues": issues[:20]}
+
+
+def download_account_articles(
+    base: Path,
+    rows: list[dict[str, Any]],
+    output_root: str = "",
+    no_assets: bool = False,
+    force: bool = False,
+    include_video: bool = False,
+    video_quality: str = "highest",
+) -> dict[str, Any]:
+    if not rows:
         raise RuntimeError("no articles selected")
+    account_name = str(rows[0].get("account_name") or "account")
+    out_dir = account_output_dir(output_root, account_name)
+    skipped: list[dict[str, Any]] = []
+    rows_to_download: list[dict[str, Any]] = []
+    redownload_count = 0
+    missing_downloaded_ids: list[int] = []
+    for row in rows:
+        exists, index_item = account_index_file_exists(out_dir, row)
+        if exists and not force:
+            skipped.append({
+                "article_id": int(row["id"]),
+                "title": row.get("title", ""),
+                "source_url": row.get("url", ""),
+                "markdown_path": index_item.get("markdown_path", ""),
+                "image_dir": index_item.get("image_dir", ""),
+                "status": "skipped",
+                "skip_reason": "file_exists",
+            })
+        else:
+            if exists or int(row.get("content_downloaded") or 0):
+                redownload_count += 1
+            if int(row.get("content_downloaded") or 0):
+                missing_downloaded_ids.append(int(row["id"]))
+            rows_to_download.append(row)
+    if not rows_to_download:
+        library_check = verify_account_library(base, int(rows[0].get("account_id") or 0), out_dir)
+        video_result = download_exporter_videos(base, rows, out_dir, video_quality) if include_video else {}
+        return {
+            "ok": not include_video or bool(video_result.get("ok")),
+            "run_id": "",
+            "account": account_name,
+            "account_id": int(rows[0].get("account_id") or 0),
+            "output_dir": str(out_dir),
+            "index": str(out_dir / "index.csv"),
+            "selected_count": len(rows),
+            "success_count": 0,
+            "failure_count": 0,
+            "skipped_count": len(skipped),
+            "redownload_count": 0,
+            "skipped": skipped,
+            "failed": [],
+            "library_check": library_check,
+            "video_download": video_result,
+        }
+    pairs = [(int(row["id"]), str(row["url"])) for row in rows_to_download]
     urls = [url for _article_id, url in pairs]
+    article_ids = [article_id for article_id, _url in pairs]
+    if missing_downloaded_ids:
+        db = connect_db(base)
+        try:
+            for article_id in missing_downloaded_ids:
+                db.execute("UPDATE articles SET content_downloaded = 0, updated_at = ? WHERE id = ?", (utc_now(), article_id))
+            db.commit()
+        finally:
+            db.close()
     run_id = make_run_id()
-    if output_dir:
-        out_dir = delivery_dir(output_dir, run_id)
-    elif account_nickname:
-        out_dir = (DEFAULT_DELIVERY_DIR / _safe_dir_name(account_nickname)).expanduser().resolve()
-    else:
-        out_dir = (DEFAULT_DELIVERY_DIR / run_id).expanduser().resolve()
+    file_stems = unique_article_file_stems(rows_to_download)
     manifest = run_markdown_only_download(
         urls,
         out_dir,
         not no_assets,
-        {"mode": "exporter-download", "article_ids": article_ids},
+        {"mode": "exporter-download", "article_ids": article_ids, "account": account_name, "file_stems": file_stems},
         run_id,
     )
+    context_by_url = {
+        str(item.get("source_url") or ""): item.get("article_context")
+        for item in manifest.get("articles", [])
+        if isinstance(item.get("article_context"), dict)
+    }
+    write_account_index(out_dir, rows_to_download, manifest, run_id)
     success_urls = {item.get("source_url") for item in manifest.get("articles", [])}
     db = connect_db(base)
     try:
@@ -1346,14 +2306,255 @@ def download_articles(
         db.commit()
     finally:
         db.close()
+    context_results = []
+    for article_id, url in pairs:
+        context = context_by_url.get(url)
+        if context:
+            context_results.append(
+                resolve_article_context(
+                    base,
+                    article_id,
+                    biz=str(context.get("biz") or ""),
+                    comment_id=str(context.get("comment_id") or ""),
+                    source="public_html",
+                )
+            )
+    library_check = verify_account_library(base, int(rows[0].get("account_id") or 0), out_dir)
+    video_result = download_exporter_videos(base, rows_to_download, out_dir, video_quality) if include_video else {}
     return {
-        "ok": manifest["failure_count"] == 0,
+        "ok": manifest["failure_count"] == 0 and (not include_video or bool(video_result.get("ok"))),
         "run_id": manifest["run_id"],
+        "account": account_name,
+        "account_id": int(rows[0].get("account_id") or 0),
         "output_dir": manifest["output_dir"],
         "index": manifest["index"],
+        "selected_count": len(rows),
         "success_count": manifest["success_count"],
         "failure_count": manifest["failure_count"],
+        "skipped_count": len(skipped),
+        "redownload_count": redownload_count,
+        "skipped": skipped,
         "failed": manifest["failed"],
+        "article_contexts": context_results,
+        "library_check": library_check,
+        "video_download": video_result,
+    }
+
+
+def download_articles(
+    base: Path,
+    article_ids: list[int],
+    output_dir: str = "",
+    no_assets: bool = False,
+    account_nickname: str = "",
+    force: bool = False,
+    include_video: bool = False,
+    video_quality: str = "highest",
+) -> dict[str, Any]:
+    rows = get_article_download_rows(base, article_ids)
+    if not rows:
+        raise RuntimeError("no articles selected")
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(int(row.get("account_id") or 0), []).append(row)
+    if len(grouped) == 1:
+        only_rows = next(iter(grouped.values()))
+        return download_account_articles(base, only_rows, output_dir, no_assets, force, include_video, video_quality)
+    results = [
+        download_account_articles(base, group_rows, output_dir, no_assets, force, include_video, video_quality)
+        for _account_id, group_rows in sorted(grouped.items())
+    ]
+    return {
+        "ok": all(result.get("ok") for result in results),
+        "mode": "multi-account",
+        "account_count": len(results),
+        "selected_count": sum(int(result.get("selected_count") or 0) for result in results),
+        "success_count": sum(int(result.get("success_count") or 0) for result in results),
+        "failure_count": sum(int(result.get("failure_count") or 0) for result in results),
+        "skipped_count": sum(int(result.get("skipped_count") or 0) for result in results),
+        "redownload_count": sum(int(result.get("redownload_count") or 0) for result in results),
+        "results": results,
+        "output_dirs": [result.get("output_dir") for result in results],
+        "indexes": [result.get("index") for result in results],
+        "skipped": [item for result in results for item in result.get("skipped", [])],
+        "failed": [item for result in results for item in result.get("failed", [])],
+        "video_downloads": [result.get("video_download") for result in results if result.get("video_download")],
+    }
+
+
+def latest_metrics_by_article(base: Path, article_ids: list[int]) -> dict[int, dict[str, Any]]:
+    if not article_ids:
+        return {}
+    placeholders = ",".join("?" for _ in article_ids)
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            f"""
+            SELECT m.*
+            FROM article_metrics m
+            JOIN (
+                SELECT article_id, MAX(captured_at) AS captured_at
+                FROM article_metrics
+                WHERE article_id IN ({placeholders})
+                GROUP BY article_id
+            ) latest
+              ON latest.article_id = m.article_id
+             AND latest.captured_at = m.captured_at
+            """,
+            article_ids,
+        ).fetchall()
+        return {int(row["article_id"]): dict(row) for row in rows}
+    finally:
+        db.close()
+
+
+def elected_comments_by_article(base: Path, article_ids: list[int], limit_per_article: int = 100) -> dict[int, list[dict[str, Any]]]:
+    if not article_ids:
+        return {}
+    placeholders = ",".join("?" for _ in article_ids)
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            f"""
+            SELECT *
+            FROM article_comments
+            WHERE article_id IN ({placeholders})
+              AND comment_scope = 'elected'
+            ORDER BY article_id, like_count DESC, create_time DESC, id DESC
+            """,
+            article_ids,
+        ).fetchall()
+    finally:
+        db.close()
+    result: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        article_id = int(row["article_id"])
+        items = result.setdefault(article_id, [])
+        if len(items) < max(1, limit_per_article):
+            items.append(dict(row))
+    return result
+
+
+def render_engagement_page_data_markdown(metrics: dict[str, Any] | None, comments: list[dict[str, Any]], captured_at: str = "") -> str:
+    metrics = metrics or {}
+    metric_labels = [
+        ("read_count", "阅读"),
+        ("like_count", "点赞"),
+        ("old_like_count", "在看"),
+        ("comment_count", "评论数"),
+        ("favorite_count", "收藏数"),
+        ("share_count", "分享"),
+    ]
+    lines = [
+        PAGE_DATA_START,
+        "",
+        "## 页面数据",
+        "",
+        f"- 抓取时间：{captured_at or metrics.get('captured_at') or utc_now()}",
+        "- 数据来源：微信短时会话接口",
+        "- 数据边界：只包含接口返回的互动指标和精选评论；不等于全量评论或完整回复树。",
+        "",
+        "### 互动数据",
+        "",
+        "| 字段 | 值 | 来源 |",
+        "|---|---:|---|",
+    ]
+    for key, label in metric_labels:
+        value = metrics.get(key)
+        display = "missing" if value is None or value == "" else str(value)
+        source = str(metrics.get("source") or "wechat_session_api") if display != "missing" else "missing"
+        lines.append(f"| {label} | {markdown_cell(display)} | {markdown_cell(source)} |")
+    lines.extend(
+        [
+            "",
+            "### 精选评论",
+            "",
+            f"- 评论范围：精选评论",
+            f"- 评论数量：{len(comments)}",
+        ]
+    )
+    if comments:
+        lines.extend(["", "| 序号 | 昵称 | 时间 | 点赞 | 评论 |", "|---:|---|---|---:|---|"])
+        for index, item in enumerate(comments, start=1):
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        str(index),
+                        markdown_cell(item.get("nick_name") or "missing"),
+                        markdown_cell(item.get("create_time") or "missing"),
+                        markdown_cell(item.get("like_count") if item.get("like_count") is not None else "missing"),
+                        markdown_cell(item.get("content") or "missing"),
+                    ]
+                )
+                + " |"
+            )
+    else:
+        lines.extend(["", "- missing"])
+    lines.extend(["", PAGE_DATA_END, ""])
+    return "\n".join(lines)
+
+
+def upsert_markdown_section(markdown_path: Path, section: str) -> bool:
+    if not markdown_path.exists():
+        return False
+    current = markdown_path.read_text(encoding="utf-8")
+    block_re = re.compile(rf"\n*{re.escape(PAGE_DATA_START)}.*?{re.escape(PAGE_DATA_END)}\n*", re.S)
+    if block_re.search(current):
+        updated = block_re.sub("\n\n" + section.strip() + "\n", current).rstrip() + "\n"
+    else:
+        updated = current.rstrip() + "\n\n" + section.strip() + "\n"
+    if updated != current:
+        markdown_path.write_text(updated, encoding="utf-8")
+    return True
+
+
+def write_engagement_to_markdown(base: Path, article_ids: list[int], output_root: str = "") -> dict[str, Any]:
+    rows = get_article_download_rows(base, article_ids)
+    if not rows:
+        return {"ok": False, "error": "no articles selected", "updated_count": 0, "missing_count": 0}
+    metrics_by_article = latest_metrics_by_article(base, [int(row["id"]) for row in rows])
+    comments_by_article = elected_comments_by_article(base, [int(row["id"]) for row in rows])
+    updated: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    by_account: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_account.setdefault(int(row.get("account_id") or 0), []).append(row)
+    for _account_id, account_rows in by_account.items():
+        account_name = str(account_rows[0].get("account_name") or "account")
+        out_dir = account_output_dir(output_root, account_name)
+        index = read_account_index(out_dir)
+        for row in account_rows:
+            article_id = int(row["id"])
+            indexed = index.get(str(article_id)) or index.get(str(row.get("url") or ""))
+            markdown_rel = str((indexed or {}).get("markdown_path") or "")
+            markdown_path = Path(markdown_rel) if markdown_rel else Path()
+            if markdown_rel and not markdown_path.is_absolute():
+                markdown_path = out_dir / markdown_path
+            if not markdown_rel or not markdown_path.exists():
+                missing.append({"article_id": article_id, "title": row.get("title", ""), "code": "markdown_missing"})
+                continue
+            section = render_engagement_page_data_markdown(
+                metrics_by_article.get(article_id),
+                comments_by_article.get(article_id, []),
+            )
+            if upsert_markdown_section(markdown_path, section):
+                updated.append({"article_id": article_id, "title": row.get("title", ""), "markdown_path": str(markdown_path)})
+    if missing:
+        log_evolution_event(
+            base,
+            "markdown_writeback",
+            "markdown_missing",
+            "warning",
+            account_id=int(rows[0].get("account_id") or 0),
+            detail={"missing_count": len(missing), "article_count": len(rows)},
+        )
+    return {
+        "ok": not missing,
+        "updated_count": len(updated),
+        "missing_count": len(missing),
+        "updated": updated,
+        "missing": missing,
     }
 
 
@@ -1563,28 +2764,580 @@ def import_comments(base: Path, path_or_json: str) -> dict[str, Any]:
             if not article_id:
                 missing += 1
                 continue
-            db.execute(
-                """
-                INSERT INTO article_comments
-                    (article_id, comment_id, nick_name, content, like_count, create_time, raw_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    article_id,
-                    str(row.get("comment_id") or row.get("id") or ""),
-                    str(row.get("nick_name") or row.get("nickname") or row.get("user") or ""),
-                    str(row.get("content") or row.get("comment") or ""),
-                    maybe_int(row.get("like_count") or row.get("like")),
-                    parse_time(row.get("create_time") or row.get("time")),
-                    json_dumps(row),
-                    utc_now(),
-                ),
-            )
+            upsert_comment_row(db, article_id, row)
             inserted += 1
         db.commit()
     finally:
         db.close()
     return {"ok": True, "inserted_count": inserted, "missing_count": missing}
+
+
+def flush_captured_comments(base: Path) -> dict[str, Any]:
+    capture_dir = base / "comments-capture"
+    if not capture_dir.exists():
+        return {"ok": True, "files_processed": 0, "inserted": 0, "missing_articles": 0, "errors": []}
+    imported_dir = capture_dir / "imported"
+    imported_dir.mkdir(parents=True, exist_ok=True)
+    init_exporter_db(base)
+    db = connect_db(base)
+    files_processed = 0
+    total_inserted = 0
+    total_missing = 0
+    files_skipped = 0
+    errors: list[str] = []
+    try:
+        for path in sorted(capture_dir.glob("*.json")):
+            appmsgid = path.stem
+            try:
+                comments = json.loads(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                errors.append(f"{path.name}: {exc}")
+                continue
+            if not isinstance(comments, list):
+                continue
+            row = db.execute("SELECT id FROM articles WHERE msgid = ?", (appmsgid,)).fetchone()
+            if not row:
+                total_missing += len(comments)
+                files_skipped += 1
+                continue
+            article_id = int(row["id"])
+            inserted = 0
+            for c in comments:
+                if not isinstance(c, dict):
+                    continue
+                try:
+                    upsert_comment_row(db, article_id, c, source="passive_page")
+                    inserted += 1
+                except Exception as exc:
+                    errors.append(f"{path.name} comment insert: {exc}")
+            if inserted > 0:
+                db.execute("UPDATE articles SET comment_downloaded = 1, updated_at = ? WHERE id = ?", (utc_now(), article_id))
+            db.commit()
+            total_inserted += inserted
+            files_processed += 1
+            shutil.move(str(path), str(imported_dir / path.name))
+    finally:
+        db.close()
+    return {
+        "ok": True,
+        "files_processed": files_processed,
+        "files_skipped": files_skipped,
+        "inserted": total_inserted,
+        "missing_articles": total_missing,
+        "errors": errors,
+    }
+
+
+def ready_engagement_contexts(base: Path, account_id: int, limit: int) -> list[dict[str, Any]]:
+    init_exporter_db(base)
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            """
+            SELECT c.article_id, c.account_id, COALESCE(NULLIF(c.biz, ''), m.biz) AS biz, c.msgid, c.idx, c.comment_id, c.url
+            FROM article_contexts c
+            JOIN articles a ON a.id = c.article_id
+            LEFT JOIN account_biz_mappings m ON m.account_id = c.account_id
+            WHERE c.account_id = ?
+              AND COALESCE(NULLIF(c.biz, ''), m.biz, '') <> ''
+              AND c.msgid <> ''
+              AND c.comment_id <> ''
+            ORDER BY a.publish_time DESC, c.article_id DESC
+            LIMIT ?
+            """,
+            (account_id, max(1, min(int(limit or 50), 100))),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        db.close()
+
+
+def selected_engagement_contexts(base: Path, account_id: int, article_ids: list[int]) -> list[dict[str, Any]]:
+    init_exporter_db(base)
+    if not article_ids:
+        return []
+    placeholders = ",".join("?" for _ in article_ids)
+    params: list[Any] = [account_id, *article_ids]
+    db = connect_db(base)
+    try:
+        rows = db.execute(
+            f"""
+            SELECT
+                a.id AS article_id,
+                a.account_id,
+                COALESCE(NULLIF(c.biz, ''), m.biz, '') AS biz,
+                a.msgid,
+                a.idx,
+                COALESCE(NULLIF(c.comment_id, ''), '') AS comment_id,
+                a.url
+            FROM articles a
+            LEFT JOIN article_contexts c ON c.article_id = a.id
+            LEFT JOIN account_biz_mappings m ON m.account_id = a.account_id
+            WHERE a.account_id = ?
+              AND a.id IN ({placeholders})
+              AND COALESCE(NULLIF(c.biz, ''), m.biz, '') <> ''
+              AND a.msgid <> ''
+            """,
+            params,
+        ).fetchall()
+        by_id = {int(row["article_id"]): dict(row) for row in rows}
+        return [by_id[article_id] for article_id in article_ids if article_id in by_id]
+    finally:
+        db.close()
+
+
+def active_collection_broker(base: Path) -> tuple[Path, str] | None:
+    active_path = base / "context" / "active-proxy-session.json"
+    if not active_path.exists():
+        return None
+    try:
+        active = json.loads(active_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    session_id = str(active.get("session_id") or "").strip() if isinstance(active, dict) else ""
+    if not session_id:
+        return None
+    capability_path = credential_capability_path(base, session_id)
+    try:
+        capability = capability_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return credential_socket_path(base, session_id), capability
+
+
+def create_engagement_run(base: Path, account_id: int, limit: int = 50) -> dict[str, Any]:
+    contexts = ready_engagement_contexts(base, account_id, limit)
+    if not contexts:
+        return {"ok": False, "status": "missing_context", "error": "no ready article context for this account", "article_count": 0}
+    biz_values = {str(item["biz"]) for item in contexts if item.get("biz")}
+    if len(biz_values) != 1:
+        return {"ok": False, "status": "mapping_conflict", "error": "article contexts do not resolve to one __biz", "article_count": len(contexts)}
+    biz = next(iter(biz_values))
+    now = utc_now()
+    run_id = "engagement-" + make_run_id()
+    db = connect_db(base)
+    try:
+        db.execute(
+            """
+            INSERT INTO engagement_runs
+                (run_id, account_id, scope_json, status, requested_count, created_at, updated_at)
+            VALUES (?, ?, ?, 'waiting_credential', ?, ?, ?)
+            """,
+            (run_id, account_id, json_dumps({"biz": biz, "article_ids": [item["article_id"] for item in contexts]}), len(contexts), now, now),
+        )
+        db.commit()
+    finally:
+        db.close()
+    return {"ok": True, "run_id": run_id, "biz": biz, "contexts": contexts}
+
+
+def create_engagement_run_for_articles(base: Path, account_id: int, article_ids: list[int]) -> dict[str, Any]:
+    selected_ids = [int(value) for value in article_ids if int(value or 0)]
+    if not selected_ids:
+        return {"ok": False, "status": "missing_context", "error": "no articles selected", "article_count": 0}
+    contexts = selected_engagement_contexts(base, account_id, selected_ids)
+    found_ids = {int(item["article_id"]) for item in contexts}
+    missing_ids = [article_id for article_id in selected_ids if article_id not in found_ids]
+    if missing_ids:
+        return {
+            "ok": False,
+            "status": "missing_context",
+            "error": "selected articles are missing engagement context; sync the account again",
+            "article_count": len(contexts),
+            "missing_article_ids": missing_ids,
+        }
+    biz_values = {str(item["biz"]) for item in contexts if item.get("biz")}
+    if len(biz_values) != 1:
+        return {"ok": False, "status": "mapping_conflict", "error": "article contexts do not resolve to one __biz", "article_count": len(contexts)}
+    biz = next(iter(biz_values))
+    now = utc_now()
+    run_id = "engagement-" + make_run_id()
+    db = connect_db(base)
+    try:
+        db.execute(
+            """
+            INSERT INTO engagement_runs
+                (run_id, account_id, scope_json, status, requested_count, created_at, updated_at)
+            VALUES (?, ?, ?, 'waiting_credential', ?, ?, ?)
+            """,
+            (run_id, account_id, json_dumps({"biz": biz, "article_ids": selected_ids}), len(contexts), now, now),
+        )
+        db.commit()
+    finally:
+        db.close()
+    return {"ok": True, "run_id": run_id, "biz": biz, "contexts": contexts}
+
+
+def contexts_for_engagement_run(base: Path, run_id: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    db = connect_db(base)
+    try:
+        row = db.execute("SELECT * FROM engagement_runs WHERE run_id = ?", (run_id,)).fetchone()
+        if not row:
+            return None, []
+        run = dict(row)
+        scope = load_json_text(run.get("scope_json")) or {}
+        ids = [int(value) for value in scope.get("article_ids", []) if str(value).isdigit()]
+        if not ids:
+            return run, []
+        placeholders = ",".join("?" for _ in ids)
+        rows = db.execute(
+            f"""
+            SELECT c.article_id, c.account_id, COALESCE(NULLIF(c.biz, ''), m.biz) AS biz, c.msgid, c.idx, c.comment_id, c.url
+            FROM article_contexts c
+            LEFT JOIN account_biz_mappings m ON m.account_id = c.account_id
+            WHERE c.article_id IN ({placeholders})
+              AND COALESCE(NULLIF(c.biz, ''), m.biz, '') <> ''
+              AND c.msgid <> ''
+              AND c.comment_id <> ''
+            """,
+            ids,
+        ).fetchall()
+        by_id = {int(item["article_id"]): dict(item) for item in rows}
+        return run, [by_id[article_id] for article_id in ids if article_id in by_id]
+    finally:
+        db.close()
+
+
+def persist_engagement_payload(db: sqlite3.Connection, run_id: str, payload: dict[str, Any]) -> tuple[int, int, list[str]]:
+    successes = 0
+    failures = 0
+    errors: list[str] = []
+    for item in payload.get("articles", []):
+        article_id = int(item.get("article_id") or 0)
+        if not item.get("ok") or not article_id:
+            failures += 1
+            error = str(item.get("error") or "engagement_request_failed")
+            if error not in errors:
+                errors.append(error)
+            continue
+        metrics = item.get("metrics") if isinstance(item.get("metrics"), dict) else {}
+        captured_at = utc_now()
+        db.execute(
+            """
+            INSERT INTO article_metrics
+                (run_id, article_id, source, captured_at, read_count, like_count, old_like_count, share_count, comment_count, raw_json)
+            VALUES (?, ?, 'wechat_session_api', ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, article_id, source) DO UPDATE SET
+                captured_at = excluded.captured_at,
+                read_count = excluded.read_count,
+                like_count = excluded.like_count,
+                old_like_count = excluded.old_like_count,
+                share_count = excluded.share_count,
+                comment_count = excluded.comment_count,
+                raw_json = excluded.raw_json
+            """,
+            (
+                run_id,
+                article_id,
+                captured_at,
+                maybe_int(metrics.get("read_count")),
+                maybe_int(metrics.get("like_count")),
+                maybe_int(metrics.get("old_like_count")),
+                maybe_int(metrics.get("share_count")),
+                maybe_int(metrics.get("comment_count")),
+                json_dumps(metrics),
+            ),
+        )
+        for comment in item.get("comments", []):
+            if isinstance(comment, dict):
+                upsert_comment_row(db, article_id, {**comment, "complete": 1 if item.get("comments_complete") else 0}, source="wechat_session_api")
+        successes += 1
+    return successes, failures, errors
+
+
+def execute_engagement_run(base: Path, run_id: str) -> dict[str, Any]:
+    """Resume one user-authorized run without exposing credentials outside the broker."""
+    db = connect_db(base)
+    try:
+        claimed = db.execute(
+            "UPDATE engagement_runs SET status = 'engagement_syncing', error = '', updated_at = ? WHERE run_id = ? AND status = 'waiting_credential'",
+            (utc_now(), run_id),
+        ).rowcount
+        db.commit()
+    finally:
+        db.close()
+    if not claimed:
+        return {"ok": False, "run_id": run_id, "status": "not_waiting"}
+    run, contexts = contexts_for_engagement_run(base, run_id)
+    if not run or not contexts:
+        db = connect_db(base)
+        try:
+            db.execute(
+                "UPDATE engagement_runs SET status = 'completed_with_gaps', error = 'article context is no longer ready', updated_at = ? WHERE run_id = ?",
+                (utc_now(), run_id),
+            )
+            db.commit()
+        finally:
+            db.close()
+        return {"ok": False, "run_id": run_id, "status": "missing_context"}
+    biz = str((load_json_text(run["scope_json"]) or {}).get("biz") or "")
+    broker = active_collection_broker(base)
+    if not broker:
+        payload = {"ok": False, "status": "unavailable", "error": "credential broker is not running"}
+    else:
+        payload = None
+    successes = 0
+    failures = 0
+    failure_errors: list[str] = []
+    for offset in range(0, len(contexts), 10):
+        if payload is not None:
+            break
+        payload = broker_request(
+            broker[0],
+            {"op": "fetch_engagement", "biz": biz, "articles": contexts[offset : offset + 10], "capability": broker[1]},
+            timeout_seconds=180,
+        )
+        if payload.get("status") in {"waiting_credential", "unavailable"} or not payload.get("articles"):
+            break
+        db = connect_db(base)
+        try:
+            added_successes, added_failures, added_errors = persist_engagement_payload(db, run_id, payload)
+            successes += added_successes
+            failures += added_failures
+            failure_errors.extend(error for error in added_errors if error not in failure_errors)
+            db.commit()
+        finally:
+            db.close()
+        payload = None
+    if payload is not None:
+        error = str(payload.get("error") or "valid credential is unavailable")
+        log_evolution_event(
+            base,
+            "engagement_sync",
+            str(payload.get("status") or "waiting_credential"),
+            "warning",
+            account_id=int(run.get("account_id") or 0) if run else 0,
+            run_id=run_id,
+            detail={"article_count": len(contexts), "error": error},
+        )
+        db = connect_db(base)
+        try:
+            db.execute("UPDATE engagement_runs SET status = 'waiting_credential', error = ?, updated_at = ? WHERE run_id = ?", (error, utc_now(), run_id))
+            db.commit()
+        finally:
+            db.close()
+        return {"ok": False, "run_id": run_id, "status": "waiting_credential", "article_count": len(contexts), "error": error}
+    db = connect_db(base)
+    try:
+        status = "complete" if failures == 0 else "partial"
+        db.execute(
+            """
+            UPDATE engagement_runs
+            SET status = ?, success_count = ?, failed_count = ?, error = ?, updated_at = ?
+            WHERE run_id = ?
+            """,
+            (status, successes, failures, "; ".join(failure_errors), utc_now(), run_id),
+        )
+        db.commit()
+    finally:
+        db.close()
+    return {
+        "ok": failures == 0,
+        "run_id": run_id,
+        "status": "complete" if failures == 0 else "partial",
+        "article_count": len(contexts),
+        "success_count": successes,
+        "failed_count": failures,
+        "errors": failure_errors,
+        "comment_scope": "elected",
+    }
+
+
+def sync_engagement(
+    base: Path,
+    account_id: int,
+    limit: int = 50,
+    auto_start_collection: bool = True,
+    output_root: str = "",
+) -> dict[str, Any]:
+    created = create_engagement_run(base, account_id, limit)
+    if not created.get("ok"):
+        return created
+    collection_session: dict[str, Any] | None = None
+    if auto_start_collection and not active_collection_broker(base):
+        collection_session = start_proxy_enhancer_session(base, upstream_proxy="none", yes=True)
+        if not collection_session.get("ok"):
+            log_evolution_event(
+                base,
+                "wechat_collection_start",
+                str(collection_session.get("stage") or collection_session.get("error") or "start_failed"),
+                "error",
+                account_id=account_id,
+                run_id=str(created["run_id"]),
+                detail={"status": collection_session.get("mode") or "", "requires_confirmation": collection_session.get("requires_confirmation", False)},
+            )
+    result = execute_engagement_run(base, str(created["run_id"]))
+    representative_url = str(created["contexts"][0].get("url") or "")
+    if result.get("status") != "waiting_credential" or not representative_url:
+        writeback = (
+            write_engagement_to_markdown(base, [int(item["article_id"]) for item in created["contexts"]], output_root)
+            if result.get("status") in {"complete", "partial"}
+            else None
+        )
+        return {**result, "representative_url": representative_url, "collection_session": collection_session, "markdown_writeback": writeback}
+    copied, clipboard_method = copy_to_clipboard(representative_url)
+    return {
+        **result,
+        "representative_url": representative_url,
+        "copied_to_clipboard": copied,
+        "clipboard_method": clipboard_method if copied else "",
+        "clipboard_error": "" if copied else clipboard_method,
+        "collection_session": collection_session,
+        "next_step": "已复制代表文章链接，请粘贴到微信客户端并打开；打开后继续恢复本任务。",
+    }
+
+
+def sync_engagement_for_articles(
+    base: Path,
+    account_id: int,
+    article_ids: list[int],
+    auto_start_collection: bool = True,
+    output_root: str = "",
+) -> dict[str, Any]:
+    created = create_engagement_run_for_articles(base, account_id, article_ids)
+    if not created.get("ok"):
+        return created
+    collection_session: dict[str, Any] | None = None
+    if auto_start_collection and not active_collection_broker(base):
+        collection_session = start_proxy_enhancer_session(base, upstream_proxy="none", yes=True)
+        if not collection_session.get("ok"):
+            log_evolution_event(
+                base,
+                "wechat_collection_start",
+                str(collection_session.get("stage") or collection_session.get("error") or "start_failed"),
+                "error",
+                account_id=account_id,
+                run_id=str(created["run_id"]),
+                detail={"status": collection_session.get("mode") or "", "requires_confirmation": collection_session.get("requires_confirmation", False)},
+            )
+    result = execute_engagement_run(base, str(created["run_id"]))
+    representative_url = str(created["contexts"][0].get("url") or "")
+    selected_ids = [int(item["article_id"]) for item in created["contexts"]]
+    if result.get("status") != "waiting_credential" or not representative_url:
+        writeback = (
+            write_engagement_to_markdown(base, selected_ids, output_root)
+            if result.get("status") in {"complete", "partial"}
+            else None
+        )
+        return {**result, "representative_url": representative_url, "collection_session": collection_session, "markdown_writeback": writeback}
+    copied, clipboard_method = copy_to_clipboard(representative_url)
+    return {
+        **result,
+        "representative_url": representative_url,
+        "copied_to_clipboard": copied,
+        "clipboard_method": clipboard_method if copied else "",
+        "clipboard_error": "" if copied else clipboard_method,
+        "collection_session": collection_session,
+        "next_step": "已复制代表文章链接，请粘贴到微信客户端并打开；打开后继续恢复本任务。",
+    }
+
+
+def resume_waiting_engagement_runs(base: Path, biz: str = "", run_id: str = "", output_root: str = "") -> dict[str, Any]:
+    init_exporter_db(base)
+    db = connect_db(base)
+    try:
+        if run_id:
+            rows = db.execute(
+                "SELECT run_id, scope_json FROM engagement_runs WHERE status = 'waiting_credential' AND run_id = ?",
+                (run_id,),
+            ).fetchall()
+        else:
+            rows = db.execute("SELECT run_id, scope_json FROM engagement_runs WHERE status = 'waiting_credential' ORDER BY created_at").fetchall()
+    finally:
+        db.close()
+    run_ids = [str(row["run_id"]) for row in rows if not biz or str((load_json_text(row["scope_json"]) or {}).get("biz") or "") == biz]
+    results = [execute_engagement_run(base, run_id) for run_id in run_ids]
+    article_ids: list[int] = []
+    for row in rows:
+        if str(row["run_id"]) not in set(run_ids):
+            continue
+        scope = load_json_text(str(row["scope_json"] or "{}")) or {}
+        article_ids.extend(int(value) for value in scope.get("article_ids", []) if str(value).isdigit())
+    terminal_statuses = {"complete", "partial"}
+    writeback = (
+        write_engagement_to_markdown(base, article_ids, output_root)
+        if article_ids and all(str(result.get("status") or "") in terminal_statuses for result in results)
+        else None
+    )
+    return {"ok": all(result.get("ok") for result in results), "run_count": len(results), "results": results, "markdown_writeback": writeback}
+
+
+def create_dataset_manifest(base: Path, account_id: int, dataset_id: str = "", output_root: str = "") -> dict[str, Any]:
+    """Publish a local-only dataset descriptor for downstream reading and analysis."""
+    init_exporter_db(base)
+    db = connect_db(base)
+    try:
+        account = db.execute("SELECT nickname FROM target_accounts WHERE id = ?", (account_id,)).fetchone()
+        if not account:
+            return {"ok": False, "error": "account not found"}
+        rows = db.execute(
+            """
+            SELECT a.id, a.title, a.url, a.publish_time, a.content_downloaded,
+                   c.context_status, c.biz,
+                   (SELECT captured_at FROM article_metrics m WHERE m.article_id = a.id ORDER BY m.captured_at DESC LIMIT 1) AS metrics_captured_at,
+                   (SELECT source FROM article_metrics m WHERE m.article_id = a.id ORDER BY m.captured_at DESC LIMIT 1) AS metrics_source,
+                   (SELECT COUNT(*) FROM article_comments ac WHERE ac.article_id = a.id AND ac.comment_scope = 'elected') AS elected_comment_count
+            FROM articles a
+            LEFT JOIN article_contexts c ON c.article_id = a.id
+            WHERE a.account_id = ?
+            ORDER BY a.publish_time DESC, a.id DESC
+            """,
+            (account_id,),
+        ).fetchall()
+    finally:
+        db.close()
+    account_name = str(account["nickname"] or "account")
+    account_dir = account_output_dir(output_root, account_name)
+    index = read_account_index(account_dir)
+    dataset_id = safe_name(dataset_id or f"dataset-{make_run_id()}", 80)
+    dataset_dir = account_dir / "datasets" / dataset_id
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    articles = []
+    for row in rows:
+        item = dict(row)
+        indexed = index.get(str(item["id"])) or index.get(str(item["url"])) or {}
+        markdown = str(indexed.get("markdown_path") or "")
+        markdown_path = str((account_dir / markdown).resolve()) if markdown and not Path(markdown).is_absolute() else markdown
+        articles.append(
+            {
+                "article_id": int(item["id"]),
+                "title": str(item["title"] or ""),
+                "url": str(item["url"] or ""),
+                "publish_time": str(item["publish_time"] or ""),
+                "markdown_path": markdown_path,
+                "content_status": "ready" if item["content_downloaded"] and markdown_path else "missing",
+                "context_status": str(item["context_status"] or "missing"),
+                "engagement": {
+                    "source": str(item["metrics_source"] or "missing"),
+                    "captured_at": str(item["metrics_captured_at"] or ""),
+                    "comment_scope": "elected",
+                    "elected_comment_count": int(item["elected_comment_count"] or 0),
+                },
+            }
+        )
+    manifest = {
+        "version": 1,
+        "dataset_id": dataset_id,
+        "account_id": account_id,
+        "account_name": account_name,
+        "created_at": utc_now(),
+        "article_count": len(articles),
+        "articles": articles,
+    }
+    manifest_path = dataset_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    csv_path = dataset_dir / "manifest.csv"
+    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["article_id", "title", "url", "publish_time", "markdown_path", "content_status", "context_status", "metrics_source", "metrics_captured_at", "elected_comment_count"])
+        writer.writeheader()
+        for item in articles:
+            writer.writerow({
+                "article_id": item["article_id"], "title": item["title"], "url": item["url"], "publish_time": item["publish_time"],
+                "markdown_path": item["markdown_path"], "content_status": item["content_status"], "context_status": item["context_status"],
+                "metrics_source": item["engagement"]["source"], "metrics_captured_at": item["engagement"]["captured_at"],
+                "elected_comment_count": item["engagement"]["elected_comment_count"],
+            })
+    return {"ok": True, "dataset_id": dataset_id, "manifest": str(manifest_path), "csv": str(csv_path), "article_count": len(articles)}
 
 
 def list_comments(base: Path, article_id: int, limit: int = 100) -> list[dict[str, Any]]:
@@ -1594,6 +3347,7 @@ def list_comments(base: Path, article_id: int, limit: int = 100) -> list[dict[st
         rows = db.execute(
             """
             SELECT id, article_id, comment_id, nick_name, content, like_count, create_time
+                   , comment_scope, source, fetched_at, complete
             FROM article_comments
             WHERE article_id = ?
             ORDER BY create_time DESC, id DESC
@@ -1759,13 +3513,12 @@ def render_articles_table(articles: list[dict[str, Any]]) -> str:
             f"<td>{html_escape(item['title'])}<div class='small'>{html_escape(item['digest'])}</div></td>"
             f"<td>{html_escape(item['publish_time'])}</td>"
             f"<td>{'是' if item['content_downloaded'] else '否'}</td>"
-            f"<td>{html_escape(item['read_count'] or '')}</td>"
             f"<td><a href='{html_escape(item['url'])}' target='_blank'>原文</a></td>"
             "</tr>"
         )
     return (
         "<form id='download-selected' method='post' action='/download-selected'></form>"
-        "<table><thead><tr><th></th><th>ID</th><th>标题</th><th>发布时间</th><th>内容已下载</th><th>阅读</th><th>操作</th></tr></thead>"
+        "<table><thead><tr><th></th><th>ID</th><th>标题</th><th>发布时间</th><th>内容已下载</th><th>操作</th></tr></thead>"
         "<tbody>"
         + "".join(rows)
         + "</tbody></table><p><button form='download-selected'>下载选中</button></p>"
@@ -2084,13 +3837,7 @@ def command_login_start(args: argparse.Namespace) -> int:
 
 
 def command_login_qr_start(args: argparse.Namespace) -> int:
-    result = start_qr_login(runtime_dir(args.runtime_dir), args.base_url)
-    if args.open:
-        qrcode_path = Path(str(result["qrcode_path"]))
-        if sys.platform == "darwin":
-            subprocess.run(["open", str(qrcode_path)], check=False)
-        else:
-            webbrowser.open(qrcode_path.as_uri())
+    result = start_qr_login(runtime_dir(args.runtime_dir), args.base_url, open_qrcode=args.open)
     write_json_response(result)
     return 0
 
@@ -2102,7 +3849,7 @@ def command_login_qr_status(args: argparse.Namespace) -> int:
 
 
 def command_login_qr_complete(args: argparse.Namespace) -> int:
-    result = complete_qr_login(runtime_dir(args.runtime_dir), args.login_id, args.profile)
+    result = complete_qr_login(runtime_dir(args.runtime_dir), args.login_id, args.profile, args.allow_plain_auth_key)
     write_json_response(result)
     return 0
 
@@ -2212,12 +3959,18 @@ def sync_all_accounts(base: Path, per_account_limit: int = 50) -> dict[str, Any]
     }
 
 
-def download_new_articles(base: Path, output_dir: str = "", no_assets: bool = False) -> dict[str, Any]:
+def download_new_articles(
+    base: Path,
+    output_dir: str = "",
+    no_assets: bool = False,
+    include_video: bool = False,
+    video_quality: str = "highest",
+) -> dict[str, Any]:
     rows = list_articles(base, account_id=0, limit=5000, downloaded="no")
     if not rows:
         return {"ok": True, "message": "no new articles to download", "success_count": 0, "failure_count": 0}
     ids = [int(row["id"]) for row in rows]
-    return download_articles(base, ids, output_dir, no_assets)
+    return download_articles(base, ids, output_dir, no_assets, include_video=include_video, video_quality=video_quality)
 
 
 def daily_run(base: Path, per_account_limit: int = 50, output_dir: str = "", no_assets: bool = False) -> dict[str, Any]:
@@ -2236,7 +3989,7 @@ def command_sync_all(args: argparse.Namespace) -> int:
 
 
 def command_download_new(args: argparse.Namespace) -> int:
-    result = download_new_articles(runtime_dir(args.runtime_dir), args.output_dir, args.no_assets)
+    result = download_new_articles(runtime_dir(args.runtime_dir), args.output_dir, args.no_assets, args.include_video, args.video_quality)
     write_json_response(result)
     return 0 if result.get("ok") else 1
 
@@ -2249,6 +4002,15 @@ def command_daily_run(args: argparse.Namespace) -> int:
 
 def command_articles(args: argparse.Namespace) -> int:
     rows = list_articles(runtime_dir(args.runtime_dir), args.account_id, args.limit, args.keyword, args.collection_id, args.downloaded)
+    legacy_engagement_fields = {
+        "comment_downloaded",
+        "read_count",
+        "like_count",
+        "share_count",
+        "favorite_count",
+        "comment_count",
+    }
+    rows = [{key: value for key, value in row.items() if key not in legacy_engagement_fields} for row in rows]
     write_json_response({"ok": True, "count": len(rows), "articles": rows})
     return 0
 
@@ -2274,7 +4036,15 @@ def command_download(args: argparse.Namespace) -> int:
         keyword=args.keyword,
         collection_id=args.collection_id,
     )
-    result = download_articles(base, ids, args.output_dir, args.no_assets)
+    result = download_articles(
+        base,
+        ids,
+        args.output_dir,
+        args.no_assets,
+        force=args.force,
+        include_video=args.include_video,
+        video_quality=args.video_quality,
+    )
     write_json_response(result)
     return 0 if result.get("ok") else 1
 
@@ -2304,25 +4074,72 @@ def command_collection_add(args: argparse.Namespace) -> int:
 def command_download_collection(args: argparse.Namespace) -> int:
     base = runtime_dir(args.runtime_dir)
     ids = select_article_ids(base, collection_id=args.collection_id)
-    result = download_articles(base, ids, args.output_dir, args.no_assets)
+    result = download_articles(base, ids, args.output_dir, args.no_assets, force=args.force)
     write_json_response(result)
     return 0 if result.get("ok") else 1
 
 
 def command_metrics_import(args: argparse.Namespace) -> int:
-    write_json_response(import_metrics(runtime_dir(args.runtime_dir), args.input))
-    return 0
+    result = import_metrics(runtime_dir(args.runtime_dir), args.input)
+    write_json_response(result)
+    return 0 if result.get("ok") else 1
 
 
 def command_comments_import(args: argparse.Namespace) -> int:
-    write_json_response(import_comments(runtime_dir(args.runtime_dir), args.input))
-    return 0
+    result = import_comments(runtime_dir(args.runtime_dir), args.input)
+    write_json_response(result)
+    return 0 if result.get("ok") else 1
 
 
 def command_comments(args: argparse.Namespace) -> int:
     rows = list_comments(runtime_dir(args.runtime_dir), args.article_id, args.limit)
     write_json_response({"ok": True, "count": len(rows), "comments": rows})
     return 0
+
+
+def command_article_context(args: argparse.Namespace) -> int:
+    html_text = ""
+    if args.html_file:
+        html_text = Path(args.html_file).expanduser().read_text(encoding="utf-8")
+    result = resolve_article_context(
+        runtime_dir(args.runtime_dir), args.article_id, html_text, args.biz, args.source, args.comment_id
+    )
+    write_json_response(scrub_payload(result))
+    return 0 if result.get("ok") else 1
+
+
+def command_wechat_collection_sync_engagement(args: argparse.Namespace) -> int:
+    result = sync_engagement(runtime_dir(args.runtime_dir), args.account_id, args.limit, output_root=args.output_dir)
+    write_json_response(scrub_payload(result))
+    return 0 if result.get("ok") else 1
+
+
+def command_wechat_collection_resume_engagement(args: argparse.Namespace) -> int:
+    result = resume_waiting_engagement_runs(runtime_dir(args.runtime_dir), args.biz, args.run_id, args.output_dir)
+    write_json_response(scrub_payload(result))
+    return 0 if result.get("ok") else 1
+
+
+def command_wechat_collection_writeback(args: argparse.Namespace) -> int:
+    ids = [int(part) for part in re.split(r"[,，\s]+", args.article_ids.strip()) if part.strip()]
+    result = write_engagement_to_markdown(runtime_dir(args.runtime_dir), ids, args.output_dir)
+    write_json_response(scrub_payload(result))
+    return 0 if result.get("ok") else 1
+
+
+def command_wechat_collection_diagnostics(args: argparse.Namespace) -> int:
+    base = runtime_dir(args.runtime_dir)
+    result = {"ok": True, "events": list_evolution_events(base, args.limit)}
+    if args.export_fixture:
+        result["fixture"] = export_evolution_fixture(base, args.export_fixture, args.limit)
+    write_json_response(scrub_payload(result))
+    return 0
+
+
+def command_library_dataset(args: argparse.Namespace) -> int:
+    result = create_dataset_manifest(runtime_dir(args.runtime_dir), args.account_id, args.dataset_id, args.output_dir)
+    write_json_response(scrub_payload(result))
+    return 0 if result.get("ok") else 1
 
 
 def normalize_match_text(value: Any) -> str:
@@ -2456,6 +4273,7 @@ def parse_wizard_request(args: argparse.Namespace) -> dict[str, Any]:
     wants_list = args.list_only or bool(re.search(r"列出|有哪些|让我选|先看|列表", text))
     wants_sync = args.sync_only
     wants_download = not wants_list and not args.sync_only
+    wants_engagement = bool(re.search(r"评论|互动|阅读数|点赞|在看|精选留言|精选评论", text))
     return {
         "target": text,
         "account_query": query,
@@ -2470,7 +4288,46 @@ def parse_wizard_request(args: argparse.Namespace) -> dict[str, Any]:
         "no_assets": args.no_assets,
         "profile": args.profile,
         "auto_add": args.auto_add,
+        "engagement_mode": "elected" if wants_engagement else "none",
     }
+
+
+def wizard_login_required(base: Path, session_id: str, request: dict[str, Any], account: dict[str, Any] | None, error: str = "") -> dict[str, Any]:
+    """Create or reuse a QR artifact so login is visible in the task result."""
+    try:
+        existing = load_wizard_session(base, session_id).get("result", {}) if session_id else {}
+    except RuntimeError:
+        existing = {}
+    login_id = str(existing.get("login_id") or "") if isinstance(existing, dict) else ""
+    login: dict[str, Any]
+    try:
+        if login_id:
+            previous = load_qr_login_session(base, login_id)
+            if is_reusable_qr_login_session(previous):
+                login = qr_login_start_result(base, previous, open_qrcode=True, reused=True)
+            else:
+                login = start_qr_login(base, str(request.get("base_url") or ""), open_qrcode=True)
+        else:
+            login = start_qr_login(base, str(request.get("base_url") or ""), open_qrcode=True)
+    except Exception as exc:
+        return {"ok": False, "state": "need_login", "session_id": session_id, "error": str(exc) or error}
+    qrcode_path = str(login.get("qrcode_path") or "")
+    result = {
+        "ok": False,
+        "state": "need_login",
+        "session_id": session_id,
+        "account": slim_account(account) if account else {},
+        "login_id": str(login.get("login_id") or login_id),
+        "expires_at": str(login.get("expires_at") or ""),
+        "status": str(login.get("status") or ""),
+        "message": str(login.get("message") or QR_LOGIN_PROMPT),
+        "reused_existing_session": bool(login.get("reused_existing_session", False)),
+        "artifacts": [{"type": "image", "path": qrcode_path, "alt": "微信扫码登录"}] if qrcode_path else [],
+        "error": error,
+        "next_step": str(login.get("next_step") or "请扫码并在手机端确认；确认后恢复同一任务。"),
+    }
+    save_wizard_session(base, session_id, str(request.get("target") or ""), "need_login", request, selected_account_id=int(account.get("id") or 0) if account else 0, result=result)
+    return result
 
 
 def slim_account(account: dict[str, Any]) -> dict[str, Any]:
@@ -2663,15 +4520,7 @@ def run_wizard_after_account(
                 str(request.get("profile") or ""),
             )
             if not synced.get("ok") and (request.get("sync_only") or not existing or fresh_download or stale_cache):
-                save_wizard_session(base, session_id, str(request.get("target") or ""), "need_login", request, selected_account_id=account_id, result=synced)
-                return {
-                    "ok": False,
-                    "state": "need_login",
-                    "session_id": session_id,
-                    "account": slim_account(account),
-                    "error": "; ".join(synced.get("errors") or []) or "sync failed",
-                    "next_step": "先完成 exporter 扫码登录，再用 exporter-wizard --resume 继续。",
-                }
+                return wizard_login_required(base, session_id, request, account, "; ".join(synced.get("errors") or []) or "sync failed")
     if request.get("sync_only"):
         result = {
             "ok": True,
@@ -2725,17 +4574,77 @@ def run_wizard_after_account(
         save_wizard_session(base, session_id, str(request.get("target") or ""), "need_article_choice", request, selected_account_id=account_id, result=result)
         return result
 
-    downloaded = download_articles(base, selected_ids, str(request.get("output_dir") or ""), bool(request.get("no_assets")))
+    output_root = str(request.get("output_dir") or "")
+    if request.get("engagement_mode") == "elected":
+        engagement = sync_engagement_for_articles(base, account_id, selected_ids, output_root=output_root)
+        state = "waiting_wechat_collection" if engagement.get("status") == "waiting_credential" else ("done" if engagement.get("ok") else "failed_recoverable")
+        result = {
+            "ok": bool(engagement.get("ok") or engagement.get("status") == "waiting_credential"),
+            "state": state,
+            "session_id": session_id,
+            "account": slim_account(dict(get_account_row(base, account_id=account_id))),
+            "sync": synced,
+            "selected_article_ids": selected_ids,
+            "download": None,
+            "engagement": engagement,
+            "flow": "exporter-sync -> engagement batch download",
+        }
+        if engagement.get("status") == "waiting_credential":
+            result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
+        save_wizard_session(base, session_id, str(request.get("target") or ""), state, request, selected_account_id=account_id, selected_article_ids=selected_ids, result=result)
+        return result
+
+    downloaded = download_articles(base, selected_ids, output_root, bool(request.get("no_assets")), force=True)
+    engagement = None
+    state = "done"
     result = {
         "ok": downloaded.get("ok", False),
-        "state": "done",
+        "state": state,
         "session_id": session_id,
         "account": slim_account(dict(get_account_row(base, account_id=account_id))),
         "sync": synced,
         "selected_article_ids": selected_ids,
         "download": downloaded,
+        "engagement": engagement,
     }
-    save_wizard_session(base, session_id, str(request.get("target") or ""), "done", request, selected_account_id=account_id, selected_article_ids=selected_ids, result=result)
+    if engagement and engagement.get("status") == "waiting_credential":
+        result["next_step"] = engagement.get("next_step") or "已复制代表文章链接，请粘贴到微信客户端并打开；打开后回复“已打开”。"
+    save_wizard_session(base, session_id, str(request.get("target") or ""), state, request, selected_account_id=account_id, selected_article_ids=selected_ids, result=result)
+    return result
+
+
+def resume_wizard_wechat_collection(base: Path, session_id: str, session: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    previous = dict(session.get("result") or {})
+    engagement = dict(previous.get("engagement") or {})
+    run_id = str(engagement.get("run_id") or "")
+    biz = str(engagement.get("biz") or "")
+    if not biz and run_id:
+        run, _contexts = contexts_for_engagement_run(base, run_id)
+        if run:
+            scope = load_json_text(str(run.get("scope_json") or "{}")) or {}
+            biz = str(scope.get("biz") or "")
+    resumed = resume_waiting_engagement_runs(base, biz, run_id, str(request.get("output_dir") or ""))
+    state = "done" if resumed.get("ok") else "waiting_wechat_collection"
+    result = {
+        **previous,
+        "ok": bool(resumed.get("ok")),
+        "state": state,
+        "session_id": session_id,
+        "resumed_from": "waiting_wechat_collection",
+        "engagement_resume": resumed,
+    }
+    if not resumed.get("ok"):
+        result["next_step"] = "请确认代表文章已在微信客户端打开并加载评论区，然后再次恢复本任务。"
+    save_wizard_session(
+        base,
+        session_id,
+        str(request.get("target") or ""),
+        state,
+        request,
+        selected_account_id=int(session.get("selected_account_id") or 0),
+        selected_article_ids=[int(value) for value in session.get("selected_article_ids", []) if str(value).isdigit()],
+        result=result,
+    )
     return result
 
 
@@ -2746,6 +4655,25 @@ def command_wizard(args: argparse.Namespace) -> int:
         session = load_wizard_session(base, args.resume)
         request = dict(session.get("request") or {})
         session_id = args.resume
+        if session.get("state") in {"waiting_wechat_collection", "waiting_wechat_credential"}:
+            result = resume_wizard_wechat_collection(base, session_id, session, request)
+            write_json_response(scrub_payload(result))
+            return 0 if result.get("ok") else 1
+        if session.get("state") == "need_login":
+            login_id = str((session.get("result") or {}).get("login_id") or "")
+            if login_id:
+                try:
+                    login_status = qr_login_status(base, login_id)
+                    if login_status.get("ready_to_complete"):
+                        complete_qr_login(base, login_id, str(request.get("profile") or ""))
+                    else:
+                        result = {**dict(session.get("result") or {}), "login_status": login_status}
+                        write_json_response(scrub_payload(result))
+                        return 1
+                except Exception as exc:
+                    result = wizard_login_required(base, session_id, request, None, str(exc))
+                    write_json_response(scrub_payload(result))
+                    return 1
         if args.latest is not None:
             request["latest"] = args.latest
         if args.limit:
@@ -2787,15 +4715,7 @@ def command_wizard(args: argparse.Namespace) -> int:
                     write_json_response(scrub_payload(result))
                     return 0
                 else:
-                    result = {
-                        "ok": False,
-                        "state": state,
-                        "session_id": session_id,
-                        "target": request.get("target", ""),
-                        "error": resolved.get("error", ""),
-                        "next_step": "先运行 exporter-login-qr-start 完成扫码登录；如果已有 auth-key，用 exporter-config 保存。",
-                    }
-                    save_wizard_session(base, session_id, str(request.get("target") or ""), state, request, result=result)
+                    result = wizard_login_required(base, session_id, request, None, str(resolved.get("error") or ""))
                     write_json_response(scrub_payload(result))
                     return 1
         if args.article_ids:
@@ -2826,15 +4746,11 @@ def command_wizard(args: argparse.Namespace) -> int:
         save_wizard_session(base, session_id, request["target"], state, request, candidates, result=result)
         write_json_response(scrub_payload(result))
         return 0
-    result = {
-        "ok": False,
-        "state": state,
-        "session_id": session_id,
-        "target": request["target"],
-        "error": resolved.get("error", ""),
-        "next_step": "先运行 exporter-login-qr-start 完成扫码登录；如果已有 auth-key，用 exporter-config 保存。",
+    result = wizard_login_required(base, session_id, request, None, str(resolved.get("error") or "")) if state == "need_login" else {
+        "ok": False, "state": state, "session_id": session_id, "target": request["target"], "error": resolved.get("error", "")
     }
-    save_wizard_session(base, session_id, request["target"], state, request, result=result)
+    if state != "need_login":
+        save_wizard_session(base, session_id, request["target"], state, request, result=result)
     write_json_response(scrub_payload(result))
     return 1
 
@@ -2876,7 +4792,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("exporter-login-qr-start")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
     p.add_argument("--base-url", default="")
-    p.add_argument("--open", action="store_true", help="Open the QR image after fetching it")
+    p.add_argument("--open", dest="open", action="store_true", default=True, help="Open the QR image with the system viewer (default)")
+    p.add_argument("--no-open", dest="open", action="store_false", help="Do not open the QR image (for headless/CI use)")
     p.set_defaults(func=command_login_qr_start)
 
     p = sub.add_parser("exporter-login-qr-status")
@@ -2888,6 +4805,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
     p.add_argument("login_id")
     p.add_argument("--profile", default="")
+    p.add_argument("--allow-plain-auth-key", action="store_true")
     p.set_defaults(func=command_login_qr_complete)
 
     p = sub.add_parser("exporter-config")
@@ -2958,6 +4876,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
     p.add_argument("--output-dir", default="")
     p.add_argument("--no-assets", action="store_true")
+    p.add_argument("--include-video", action="store_true", help="Also download captured WeChat Channels videos when the article is video-shaped")
+    p.add_argument("--video-quality", choices=["source", "lowest", "middle", "highest"], default="highest")
     p.set_defaults(func=command_download_new)
 
     p = sub.add_parser("exporter-daily-run")
@@ -2996,6 +4916,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keyword", default="")
     p.add_argument("--output-dir", default="")
     p.add_argument("--no-assets", action="store_true")
+    p.add_argument("--force", action="store_true", help="Overwrite existing local Markdown instead of skipping")
+    p.add_argument("--include-video", action="store_true", help="Also download captured WeChat Channels videos when the article is video-shaped")
+    p.add_argument("--video-quality", choices=["source", "lowest", "middle", "highest"], default="highest")
     p.set_defaults(func=command_download)
 
     p = sub.add_parser("exporter-fields")
@@ -3023,16 +4946,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--collection-id", type=int, required=True)
     p.add_argument("--output-dir", default="")
     p.add_argument("--no-assets", action="store_true")
+    p.add_argument("--force", action="store_true", help="Overwrite existing local Markdown instead of skipping")
     p.set_defaults(func=command_download_collection)
 
     p = sub.add_parser("exporter-metrics-import")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
-    p.add_argument("input", help="JSON/CSV path or JSON text with article_id/url and read/like/share/comment counts")
+    p.add_argument("input", help="JSON/CSV path or inline JSON payload")
     p.set_defaults(func=command_metrics_import)
 
     p = sub.add_parser("exporter-comments-import")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
-    p.add_argument("input", help="JSON/CSV path or JSON text with article_id/url and comment content")
+    p.add_argument("input", help="JSON/CSV path or inline JSON payload")
     p.set_defaults(func=command_comments_import)
 
     p = sub.add_parser("exporter-comments")
@@ -3040,6 +4964,48 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--article-id", type=int, required=True)
     p.add_argument("--limit", type=int, default=100)
     p.set_defaults(func=command_comments)
+
+    p = sub.add_parser("exporter-article-context")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--article-id", type=int, required=True)
+    p.add_argument("--html-file", default="", help="Local article HTML used only to parse non-sensitive context")
+    p.add_argument("--biz", default="", help="Explicit public-account __biz; not a credential")
+    p.add_argument("--comment-id", default="", help="Explicit non-sensitive article comment ID")
+    p.add_argument("--source", default="html", choices=["html", "snapshot", "manual", "public_html"])
+    p.set_defaults(func=command_article_context)
+
+    p = sub.add_parser("wechat-collection-sync-engagement")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--account-id", type=int, required=True)
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--output-dir", default="")
+    p.set_defaults(func=command_wechat_collection_sync_engagement)
+
+    p = sub.add_parser("wechat-collection-resume-engagement")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--biz", default="")
+    p.add_argument("--run-id", default="")
+    p.add_argument("--output-dir", default="")
+    p.set_defaults(func=command_wechat_collection_resume_engagement)
+
+    p = sub.add_parser("wechat-collection-writeback")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--article-ids", required=True)
+    p.add_argument("--output-dir", default="")
+    p.set_defaults(func=command_wechat_collection_writeback)
+
+    p = sub.add_parser("wechat-collection-diagnostics")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--export-fixture", default="")
+    p.set_defaults(func=command_wechat_collection_diagnostics)
+
+    p = sub.add_parser("library-dataset")
+    p.add_argument("--runtime-dir", default=argparse.SUPPRESS)
+    p.add_argument("--account-id", type=int, required=True)
+    p.add_argument("--dataset-id", default="")
+    p.add_argument("--output-dir", default="")
+    p.set_defaults(func=command_library_dataset)
 
     p = sub.add_parser("exporter-wizard")
     p.add_argument("--runtime-dir", default=argparse.SUPPRESS)

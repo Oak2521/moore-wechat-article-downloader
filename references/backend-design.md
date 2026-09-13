@@ -10,11 +10,11 @@ The runtime has three modes:
 
 2. Account history mode
    - Input: any one article URL from the target public account.
-   - Flow follows the `qiye45/wechatDownload` pattern: use WeChat desktop client context, fetch history list, let user select, then download selected URLs.
+   - Use WeChat desktop client context, fetch history list, let user select, then download selected URLs.
 
 3. Exporter mode
    - Input: exporter auth-key, or user action to scan-login on an exporter instance.
-   - Flow follows the `wechat-article-exporter` pattern: use a WeChat Official Account backend session to search accounts, sync article metadata, manage fields/collections in SQLite, then download selected URLs through the normal Markdown downloader.
+   - Use a WeChat Official Account backend session to search accounts, sync article metadata, manage fields/collections in SQLite, then download selected URLs through the normal Markdown downloader.
 
 Do not add unrelated platform features. Content processing, rewriting, cloud deployment, and SaaS workflows are outside the runtime core. A local management page is allowed only for Exporter mode.
 
@@ -39,7 +39,7 @@ Responsibilities:
 - extract metadata
 - save one Markdown file per article
 - download allowed media assets when possible
-- write images under `images/<seq>/`
+- write images under `images/<safe-title>/`
 - write `index.csv`
 
 `--profile archive` may still write raw HTML, normalized HTML, metadata, manifest, and report for debugging.
@@ -75,10 +75,9 @@ Responsibilities:
 - sync article list with `GET /api/public/v1/article`
 - persist accounts, articles, collections, field presets, sync jobs, and download runs in `exporter.sqlite`
 - expose a local management page for search/add/sync/list/field/collection workflows
-- import enhanced metrics and comments from user-owned JSON/CSV when available
 - pass selected article URLs to the existing Markdown-only downloader
 
-Exporter mode treats collections and enhanced metrics as best-effort. Reading count, likes, comments, and shares may require short-lived WeChat article credentials and should not block list sync or downloads. When the user already has enhanced data, import it into SQLite instead of trying to silently capture credentials.
+Exporter mode does not fetch comments, reading counts, likes, shares, favorites, or other engagement metrics. Those fields require short-lived article-page credentials or browser context and belong to a separately verified proxy snapshot flow. Collections remain best-effort and should not block account/article sync or downloads.
 
 ### Skill-Driven Selection
 
@@ -94,16 +93,20 @@ The Skill shows a numbered preview in chat. The user chooses with:
 Default user-facing output:
 
 ```text
-~/Downloads/wechat-articles/<run-id>/
+~/Downloads/wechat-articles/<account-name>/
 ```
+
+URL and Exporter multi-account downloads are split by account; do not create a mixed run folder.
 
 Shape:
 
 ```text
 index.csv
-articles/<seq>-<safe-title>.md
-images/<seq>/<image-number>.<ext>
+articles/<safe-title>.md
+images/<safe-title>/<image-number>.<ext>
 ```
+
+SQLite/index state is not enough to skip an Exporter download. The Markdown file and expected image files must still exist on disk; otherwise the article is marked not downloaded and downloaded again.
 
 Internal runtime/session storage:
 
@@ -141,13 +144,13 @@ Account history mode:
 python3 scripts/wechat_downloader.py history-start "<sample-article-url>"
 python3 scripts/wechat_downloader.py history-open "<session-id>"
 python3 scripts/wechat_downloader.py history-status "<session-id>"
-python3 scripts/wechat_downloader.py history-proxy-setup --port 8899
-python3 scripts/wechat_downloader.py history-proxy-setup --port 8899 --install --yes
-python3 scripts/wechat_downloader.py history-proxy-start "<session-id>" --port 8899 --limit 100
-python3 scripts/wechat_downloader.py history-proxy-enable --port 8899 --yes
+python3 scripts/wechat_downloader.py history-proxy-setup --port 23344
+python3 scripts/wechat_downloader.py history-proxy-setup --port 23344 --install --yes
+python3 scripts/wechat_downloader.py proxy-service-start --port 23344 --upstream-proxy auto
+python3 scripts/wechat_downloader.py history-capture-prepare "<sample-article-url>" --port 23344 --use-service --yes
 python3 scripts/wechat_downloader.py adapter-watch "<session-id>" --timeout 120
-python3 scripts/wechat_downloader.py history-proxy-stop "<session-id>"
-python3 scripts/wechat_downloader.py history-proxy-disable --yes
+python3 scripts/wechat_downloader.py history-capture-finish "<session-id>" --yes
+python3 scripts/wechat_downloader.py proxy-service-stop --port 23344 --yes
 python3 scripts/wechat_downloader.py history-fetch "<session-id>" --limit 50
 python3 scripts/wechat_downloader.py history-preview --session-id "<session-id>"
 python3 scripts/wechat_downloader.py history-select --session-id "<session-id>" --latest 20
@@ -175,9 +178,6 @@ python3 scripts/wechat_exporter.py exporter-fields --set "title,url,publish_time
 python3 scripts/wechat_exporter.py exporter-collections --account-id "<id>"
 python3 scripts/wechat_exporter.py exporter-download --account-id "<id>" --latest 20
 python3 scripts/wechat_exporter.py exporter-download-collection --collection-id "<id>"
-python3 scripts/wechat_exporter.py exporter-metrics-import "<json-or-csv>"
-python3 scripts/wechat_exporter.py exporter-comments-import "<json-or-csv>"
-python3 scripts/wechat_exporter.py exporter-comments --article-id "<id>"
 ```
 
 There is no Dashboard or local web UI for URL/history flows. Exporter mode can use the local management page.
